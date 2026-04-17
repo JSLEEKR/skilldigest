@@ -444,9 +444,9 @@ fn scan_mentions_and_files(text: &str, refs: &mut Vec<SkillRef>) {
             let start = i + 2;
             if let Some(rel) = text[start..].find("]]") {
                 let inner = &text[start..start + rel];
-                if !inner.is_empty() && !inner.contains(' ') {
+                if let Some(target) = wiki_link_target(inner) {
                     refs.push(SkillRef::Mention {
-                        skill_id: SkillId::new(inner),
+                        skill_id: SkillId::new(target),
                     });
                 }
                 i = start + rel + 2;
@@ -455,6 +455,27 @@ fn scan_mentions_and_files(text: &str, refs: &mut Vec<SkillRef>) {
         }
         i += 1;
     }
+}
+
+/// Parse the inner of a `[[...]]` wiki link into the target skill id, or
+/// return `None` if the inner is empty, multi-line, or clearly prose.
+///
+/// Supports Obsidian-style `[[target|display text]]` aliases by returning
+/// only the `target` portion. Everything after the first `|` is treated as
+/// the human-facing display label and ignored for reference resolution.
+fn wiki_link_target(inner: &str) -> Option<&str> {
+    if inner.is_empty() || inner.contains('\n') {
+        return None;
+    }
+    // Obsidian allows `[[target|display text]]`. Split on the first `|` and
+    // take the target half. The target itself must not contain whitespace —
+    // a space inside the target is almost certainly prose rather than a
+    // wiki link.
+    let target = inner.split('|').next().unwrap_or("").trim();
+    if target.is_empty() || target.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(target)
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -477,11 +498,13 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
             let start = i + 2;
             if let Some(rel) = text[start..].find("]]") {
                 let inner = &text[start..start + rel];
-                // Reject multi-line or space-containing inners — those are
-                // almost certainly prose, not a wiki link.
-                if !inner.is_empty() && !inner.contains(' ') && !inner.contains('\n') {
+                // Split Obsidian-style `[[target|display]]` aliases so the
+                // display half does not end up as the (never-resolvable)
+                // skill id. A space in the target itself still rejects the
+                // match as prose.
+                if let Some(target) = wiki_link_target(inner) {
                     refs.push(SkillRef::Mention {
-                        skill_id: SkillId::new(inner),
+                        skill_id: SkillId::new(target),
                     });
                 }
                 i = start + rel + 2;

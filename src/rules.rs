@@ -140,8 +140,19 @@ fn normalise_subject(s: &str) -> String {
 
 /// Stale-file detection: for every [`SkillRef::File`] or [`SkillRef::Link`]
 /// whose `exists` field is `false`, emit an issue.
+///
+/// Also validates every `requires:` entry declared in a skill's frontmatter
+/// against the set of known skill ids. A declared dependency on a skill that
+/// does not exist in the library is a silent correctness bug — authors
+/// expect the declaration to be type-checked. Without this, a typo in
+/// `requires: [foor/commit]` stays invisible until someone tries to load the
+/// graph and wonders why the edge is missing. We emit `IssueKind::Stale`
+/// with a message that names both the dangling target and the declaring
+/// skill so the diagnostic is self-describing.
 #[must_use]
 pub fn stale(skills: &[Skill]) -> Vec<Issue> {
+    use std::collections::BTreeSet;
+    let known: BTreeSet<&str> = skills.iter().map(|s| s.id.as_str()).collect();
     let mut out = Vec::new();
     for skill in skills {
         for r in &skill.refs {
@@ -167,6 +178,21 @@ pub fn stale(skills: &[Skill]) -> Vec<Issue> {
                     );
                 }
                 _ => {}
+            }
+        }
+        for req in &skill.frontmatter.requires {
+            let normalised = SkillId::new(req);
+            if !known.contains(normalised.as_str()) {
+                out.push(
+                    Issue::new(
+                        IssueKind::Stale,
+                        skill.id.clone(),
+                        format!(
+                            "frontmatter 'requires: {req}' references skill that does not exist in the library",
+                        ),
+                    )
+                    .with_location(Location::start_of(skill.path.clone())),
+                );
             }
         }
     }

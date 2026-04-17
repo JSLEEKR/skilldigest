@@ -807,6 +807,193 @@ fn readme_does_not_claim_nonexistent_env_vars() {
     }
 }
 
+// --- Eval-H: pulldown-cmark blind-spot audit + Unix hygiene ---
+//
+// Cycle G restored `[[wiki-link]]` mentions that pulldown-cmark splits into
+// five Text events. Cycle H extends that audit:
+//
+// 1. Obsidian-style `[[target|display]]` aliases must resolve to `target`.
+//    Without this, every skill that renames a link via a pipe alias gets
+//    flagged dead while the display label becomes an (unresolvable) phantom
+//    skill id.
+// 2. Frontmatter `requires: [typo]` targeting a skill that does not exist in
+//    the library must produce a `Stale` (SKILL004) issue rather than being
+//    silently dropped by the graph builder.
+// 3. `skilldigest ... | head` must not exit 2 with `I/O error on <stdout>`.
+//    A well-behaved Unix CLI treats BrokenPipe as clean termination.
+
+#[test]
+fn wiki_link_pipe_alias_resolves_to_target() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        "See [[foo|custom display]] for details\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), "body\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let issues = v["issues"].as_array().unwrap();
+    // `foo` must not appear as a dead skill, because the README pipe-alias
+    // wiki link points at it.
+    for issue in issues {
+        let kind = issue["kind"].as_str().unwrap_or("");
+        let skill = issue["skill"].as_str().unwrap_or("");
+        assert!(
+            !(kind == "dead" && skill == "foo"),
+            "pipe-alias target 'foo' wrongly flagged dead: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn wiki_link_rejects_prose_with_space_before_pipe() {
+    // `[[foo bar|display]]` — target itself has a space, so the whole thing
+    // is prose, not a wiki link. Must not silently create a phantom mention.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        "Maybe [[foo bar|display]] is prose\n@foo\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), "body\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    // The `@foo` mention keeps `foo` alive; the prose-ish `[[foo bar|...]]`
+    // should not itself trigger any diagnostic (no crash, no false mention).
+    let issues = v["issues"].as_array().unwrap();
+    for issue in issues {
+        assert!(
+            !(issue["kind"].as_str() == Some("dead") && issue["skill"].as_str() == Some("foo")),
+            "prose probe: 'foo' wrongly dead: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn frontmatter_requires_missing_target_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(
+        dir.path().join("a/SKILL.md"),
+        "---\nname: a\nrequires:\n  - this-skill-does-not-exist\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("README.md"), "See @a for details\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let issues = v["issues"].as_array().unwrap();
+    let found = issues.iter().any(|i| {
+        i["kind"].as_str() == Some("stale")
+            && i["skill"].as_str() == Some("a")
+            && i["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("this-skill-does-not-exist")
+    });
+    assert!(
+        found,
+        "frontmatter requires: missing target must produce a Stale issue: {stdout}"
+    );
+}
+
+#[test]
+fn frontmatter_requires_existing_target_is_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+    std::fs::write(
+        dir.path().join("a/SKILL.md"),
+        "---\nname: a\nrequires:\n  - b\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("b/SKILL.md"), "body\n").unwrap();
+    std::fs::write(dir.path().join("README.md"), "@a @b\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let issues = v["issues"].as_array().unwrap();
+    // No stale issues should be present when requires target exists.
+    for issue in issues {
+        assert_ne!(
+            issue["kind"].as_str(),
+            Some("stale"),
+            "valid requires produced a stale issue: {stdout}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_pipe_exits_cleanly_not_as_operational_error() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..50 {
+        let sub = dir.path().join(format!("skill-{i:03}"));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("SKILL.md"),
+            format!(
+                "body text for skill {i} with plenty of words to make output fill the pipe buffer\n"
+            ),
+        )
+        .unwrap();
+    }
+    let mut child = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn skilldigest");
+    // Read exactly one byte and then drop the pipe — triggers BrokenPipe on
+    // the child's next write.
+    {
+        let mut stdout = child.stdout.take().unwrap();
+        let mut one = [0u8; 1];
+        let _ = stdout.read(&mut one);
+        drop(stdout);
+    }
+    let status = child.wait().expect("wait");
+    // Acceptable: 0 (clean) or 1 (issues). 2 means the CLI treated the
+    // BrokenPipe as an operational error, which is the exact bug we are
+    // guarding against.
+    let code = status.code().unwrap_or(-1);
+    assert!(
+        code == 0 || code == 1,
+        "skilldigest | head exited {code}; BrokenPipe must not surface as operational error (2)",
+    );
+    // Also verify stderr does not leak the I/O error message to users who
+    // piped into head/less/etc.
+    let mut err = String::new();
+    let _ = child.stderr.take().map(|mut s| s.read_to_string(&mut err));
+    assert!(
+        !err.contains("Broken pipe"),
+        "BrokenPipe error text leaked to stderr: {err}"
+    );
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {

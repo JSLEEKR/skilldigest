@@ -409,11 +409,23 @@ fn emit(cli: &Cli, rendered: &str) -> Result<()> {
             fs::write(path, rendered).map_err(|e| Error::io(path, e))?;
         }
         None => {
+            // Treat `BrokenPipe` as a clean termination rather than an
+            // operational error. Piping `skilldigest ... | head` must not
+            // print `I/O error on <stdout>` and exit 2 — that pattern is a
+            // first-principles Unix expectation and every well-behaved CLI
+            // silently stops when the downstream reader closes the pipe.
             let mut stdout = std::io::stdout().lock();
-            stdout
-                .write_all(rendered.as_bytes())
-                .map_err(|e| Error::io(PathBuf::from("<stdout>"), e))?;
+            if let Err(e) = stdout.write_all(rendered.as_bytes()) {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(Error::io(PathBuf::from("<stdout>"), e));
+            }
             if !rendered.ends_with('\n') {
+                // Ignore trailing-newline write failures — if the first
+                // write succeeded but this one fails with BrokenPipe, the
+                // downstream consumer already closed the pipe and we have
+                // nothing useful to report.
                 let _ = stdout.write_all(b"\n");
             }
         }
