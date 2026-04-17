@@ -272,3 +272,112 @@ fn tokens_total_matches_whole_file_tokenization() {
         "tokens subcommand must tokenize the whole file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent B, round 85).
+//
+// - `tokens_strips_bom_like_scan`: Bug 5 (MEDIUM). The tokens subcommand used
+//   to tokenize raw bytes with a leading UTF-8 BOM intact, producing a count
+//   that disagreed with the parser (which strips BOM). A BOM-prefixed file
+//   and the same file without BOM must report the same token count from the
+//   `tokens` subcommand.
+// - `cycle_participants_all_list_cycle_kind`: Bug 6 (LOW). In a 3-node cycle
+//   only the canonical "primary" skill carried `cycle` in its
+//   `issue_kinds`; the other two participants showed an empty list despite
+//   being named in the cycle issue's `related` array. PR-comment markdown
+//   and UIs were misled.
+// - `readme_lists_path_escape_rule`: Bug 7 (LOW). README rule catalogue must
+//   list SKILL011 (path-escape); the initial cycle-A fix added the issue
+//   kind but did not update docs, so users had no documentation for the new
+//   SARIF rule id.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tokens_strips_bom_like_scan() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let bom_path = dir.path().join("with_bom.md");
+    let plain_path = dir.path().join("no_bom.md");
+    let payload = b"hello world";
+    let mut f = std::fs::File::create(&bom_path).unwrap();
+    f.write_all(&[0xEF, 0xBB, 0xBF]).unwrap();
+    f.write_all(payload).unwrap();
+    drop(f);
+    std::fs::write(&plain_path, payload).unwrap();
+
+    let run = |p: &std::path::Path| {
+        let out = Command::new(bin())
+            .args(["tokens", p.to_str().unwrap(), "--format", "json"])
+            .output()
+            .expect("run tokens");
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&out.stdout).unwrap()).expect("valid json");
+        v["total"].as_u64().unwrap()
+    };
+
+    let bom_total = run(&bom_path);
+    let plain_total = run(&plain_path);
+    assert_eq!(
+        bom_total, plain_total,
+        "a leading UTF-8 BOM must not change the token count — \
+         both the scanner and the tokens subcommand strip it before tokenizing",
+    );
+}
+
+#[test]
+fn cycle_participants_all_list_cycle_kind() {
+    // Build a 3-node cycle: a -> b -> c -> a. Every skill in the cycle
+    // should surface `cycle` in its `issue_kinds`, not just the canonical
+    // primary.
+    let dir = tempfile::tempdir().unwrap();
+    for (name, body) in [("a", "@b\n"), ("b", "@c\n"), ("c", "@a\n")] {
+        let p = dir.path().join(name).join("SKILL.md");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, body).unwrap();
+    }
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).expect("valid json");
+    let skills = v["skills"].as_array().expect("skills array");
+    let participants: Vec<&str> = skills
+        .iter()
+        .filter(|s| {
+            s["issue_kinds"]
+                .as_array()
+                .map(|arr| arr.iter().any(|k| k.as_str() == Some("cycle")))
+                .unwrap_or(false)
+        })
+        .map(|s| s["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        participants.len(),
+        3,
+        "all three cycle participants must carry the cycle kind; got {:?}",
+        participants
+    );
+}
+
+#[test]
+fn readme_lists_path_escape_rule() {
+    let readme =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README");
+    assert!(
+        readme.contains("SKILL011"),
+        "README must document the SKILL011 path-escape rule so users can cross-reference SARIF output",
+    );
+    assert!(
+        readme.contains("path-escape") || readme.contains("path_escape"),
+        "README rule catalogue must describe the path-escape rule",
+    );
+}

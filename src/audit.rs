@@ -136,9 +136,16 @@ pub fn run(options: AuditOptions) -> Result<Report> {
     let summaries: Vec<SkillSummary> = skills
         .iter()
         .map(|s| {
+            // Include issues where this skill is the primary *or* appears in
+            // the `related` list. Cycle and conflict issues attach to a single
+            // "primary" skill chosen by canonical sort order; without this
+            // rollup the other N-1 participants silently advertise
+            // `issue_kinds: []` in the JSON summary, which misleads UIs and
+            // the PR-comment markdown table into thinking only one skill is
+            // involved.
             let issue_kinds: BTreeSet<IssueKind> = issues
                 .iter()
-                .filter(|i| i.skill == s.id)
+                .filter(|i| i.skill == s.id || i.related.contains(&s.id))
                 .map(|i| i.kind)
                 .collect();
             SkillSummary {

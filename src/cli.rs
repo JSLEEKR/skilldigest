@@ -187,8 +187,15 @@ fn tokens_cmd(
     // When not splitting by section, tokenize the *original* UTF-8 text
     // directly (including the `---` delimiters) rather than concatenating the
     // already-stripped frontmatter and body — the latter drops the markers
-    // and gives a slightly different count than the file as a whole.
-    let whole_text = String::from_utf8_lossy(&bytes);
+    // and gives a slightly different count than the file as a whole. Strip a
+    // leading UTF-8 BOM so the count matches the `scan` subcommand's per-skill
+    // total on BOM-prefixed files (the parser also strips BOM before
+    // tokenization). Without this strip, the byte-order mark contributes an
+    // extra token that the audit never sees.
+    let stripped: &[u8] = bytes
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(bytes.as_slice());
+    let whole_text = String::from_utf8_lossy(stripped);
     let (frontmatter_tokens, body_tokens) = if by_section {
         (
             tokenizer.count(&parsed.frontmatter_raw),
