@@ -1284,3 +1284,167 @@ fn explicit_config_pointing_at_dir_is_rejected() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// `markdown_link_with_fragment_resolves_to_underlying_file` and
+// `markdown_link_with_query_resolves_to_underlying_file`: Bug L1 (HIGH).
+//   Markdown links of the form `[t](./foo/SKILL.md#section)` and
+//   `[t](./foo/SKILL.md?v=1)` were treated as references to a literal file
+//   named `foo/SKILL.md#section` (or `?v=1`) which obviously never exists on
+//   disk — every deep-link inside a skill library produced a spurious
+//   `SKILL004 stale` warning and confused CI consumers. Browsers, GitHub
+//   Markdown rendering, and every other markdown linter strip the URI
+//   fragment / query before file resolution. Wiki-link form `[[foo#sec]]`
+//   was already fragment-stripped by Cycle I; this aligns the regular
+//   markdown-link path with that behaviour.
+//
+// `self_loop_skill_is_flagged_as_cycle`: Bug L2 (MEDIUM). A skill that
+//   `@`-mentions itself (`@a` inside `a/SKILL.md`) is by definition a
+//   reference cycle — loading 'a' depends on 'a'. The README's `SKILL005
+//   cycle` rule promises to detect "any cycle in the skill reference
+//   graph", but the underlying `tarjan_scc` in petgraph reports every node
+//   as a singleton SCC even when it has a self-loop, and the previous
+//   implementation gated cycle reporting on `scc.len() > 1`. The fix walks
+//   each singleton SCC's outgoing edges and emits a cycle issue whenever a
+//   self-edge is present.
+
+#[test]
+fn markdown_link_with_fragment_resolves_to_underlying_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"index. see [setup](./foo/SKILL.md#installation) and @foo",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), b"body").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let issues = v["issues"].as_array().unwrap();
+    let stale: Vec<_> = issues
+        .iter()
+        .filter(|i| i["kind"] == "stale")
+        .map(|i| i["message"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "no stale issues expected for fragment-anchored link; got {stale:?}"
+    );
+}
+
+#[test]
+fn markdown_link_with_query_resolves_to_underlying_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"index. see [versioned](./foo/SKILL.md?v=2) and @foo",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), b"body").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let issues = v["issues"].as_array().unwrap();
+    let stale: Vec<_> = issues
+        .iter()
+        .filter(|i| i["kind"] == "stale")
+        .map(|i| i["message"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "no stale issues expected for query-suffixed link; got {stale:?}"
+    );
+}
+
+#[test]
+fn markdown_link_with_fragment_and_query_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    // Both a query AND a fragment in either order — both must be stripped.
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"links: [a](./foo/SKILL.md?v=1#section), [b](./foo/SKILL.md#section?v=1) @foo",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), b"body").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let issues = v["issues"].as_array().unwrap();
+    let stale: Vec<_> = issues.iter().filter(|i| i["kind"] == "stale").collect();
+    assert!(stale.is_empty(), "no stale expected; got {stale:?}");
+}
+
+#[test]
+fn self_loop_skill_is_flagged_as_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    // README index keeps 'a' from being flagged dead so the only signal is
+    // the cycle detector.
+    std::fs::write(dir.path().join("README.md"), b"see @a for details").unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"see @a self ref").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "self-loop must trip exit-1 cycle: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let cycles: Vec<_> = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "cycle")
+        .collect();
+    assert_eq!(
+        cycles.len(),
+        1,
+        "exactly one cycle issue expected for the self-loop; got {cycles:?}"
+    );
+    assert!(
+        cycles[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("self-referential"),
+        "message should label this as self-referential: {cycles:?}"
+    );
+}

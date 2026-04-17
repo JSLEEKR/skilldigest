@@ -343,11 +343,40 @@ fn add_link_ref(refs: &mut Vec<SkillRef>, dest: &str) {
     if dest.starts_with('#') {
         return;
     }
-    let path = PathBuf::from(dest);
+    // Strip `#fragment` and `?query` from the destination before resolving on
+    // disk. Markdown links like `[t](./foo.md#section)` and
+    // `[t](./foo.md?v=1)` should resolve to `./foo.md` — the fragment is a
+    // browser-side anchor and the query is a versioning hint, neither of
+    // which is part of the file path. Without this strip, every deep-link
+    // (an extremely common idiom in skill libraries that link to a heading
+    // inside another skill) was reported as a `stale` broken link, polluting
+    // CI output with false positives. Mirrors the same fragment-strip we
+    // already apply to wiki-links via `wiki_link_target`.
+    let path_only = strip_link_modifiers(dest);
+    if path_only.is_empty() {
+        return;
+    }
+    let path = PathBuf::from(path_only);
     refs.push(SkillRef::Link {
         target: path,
         exists: false, // filled in later by the scanner
     });
+}
+
+/// Strip `#fragment` and `?query` from a markdown link destination so the
+/// remainder is a plain filesystem path. Returns the input unchanged when
+/// neither sigil is present.
+fn strip_link_modifiers(dest: &str) -> &str {
+    // `?` and `#` may legally appear inside a filename only if percent-encoded
+    // (per the URI spec) — anything literal terminates the path component.
+    let cut = dest
+        .find('#')
+        .map(|i| dest.find('?').map_or(i, |j| i.min(j)))
+        .or_else(|| dest.find('?'));
+    match cut {
+        Some(i) => &dest[..i],
+        None => dest,
+    }
 }
 
 fn scan_tool_invocation(text: &CowStr<'_>, refs: &mut Vec<SkillRef>) {
@@ -895,5 +924,63 @@ mod tests {
         let body = "see [section](#top)";
         let (refs, _) = extract_refs_and_rules(body);
         assert!(!refs.iter().any(|r| matches!(r, SkillRef::Link { .. })));
+    }
+
+    #[test]
+    fn link_with_fragment_strips_to_path_only() {
+        let body = "see [docs](./docs/intro.md#install)";
+        let (refs, _) = extract_refs_and_rules(body);
+        let target = refs
+            .iter()
+            .find_map(|r| match r {
+                SkillRef::Link { target, .. } => Some(target.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .expect("link captured");
+        assert_eq!(target, "./docs/intro.md");
+    }
+
+    #[test]
+    fn link_with_query_strips_to_path_only() {
+        let body = "see [docs](./docs/intro.md?v=1)";
+        let (refs, _) = extract_refs_and_rules(body);
+        let target = refs
+            .iter()
+            .find_map(|r| match r {
+                SkillRef::Link { target, .. } => Some(target.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .expect("link captured");
+        assert_eq!(target, "./docs/intro.md");
+    }
+
+    #[test]
+    fn link_with_query_and_fragment_strips_both() {
+        let body = "[a](./d.md?x=1#y) [b](./e.md#y?x=1)";
+        let (refs, _) = extract_refs_and_rules(body);
+        let targets: Vec<String> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Link { target, .. } => Some(target.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(targets.contains(&"./d.md".to_string()), "{targets:?}");
+        assert!(targets.contains(&"./e.md".to_string()), "{targets:?}");
+    }
+
+    #[test]
+    fn strip_link_modifiers_passthrough() {
+        assert_eq!(strip_link_modifiers("./foo.md"), "./foo.md");
+    }
+
+    #[test]
+    fn strip_link_modifiers_drops_fragment_only() {
+        assert_eq!(strip_link_modifiers("./foo.md#abc"), "./foo.md");
+    }
+
+    #[test]
+    fn strip_link_modifiers_drops_query_only() {
+        assert_eq!(strip_link_modifiers("./foo.md?v=1"), "./foo.md");
     }
 }

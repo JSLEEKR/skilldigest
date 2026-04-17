@@ -172,7 +172,18 @@ impl SkillGraph {
         out
     }
 
-    /// Cycle detection via Tarjan SCC. Returns one issue per SCC of size > 1.
+    /// Cycle detection via Tarjan SCC. Returns one issue per SCC of size > 1
+    /// **plus** one issue per singleton SCC that contains a self-loop edge
+    /// (`a → a`).
+    ///
+    /// `tarjan_scc` returns every node as a singleton SCC by definition, even
+    /// when that node has an edge back to itself. The "size > 1" filter is the
+    /// right gate for ordinary multi-skill cycles, but it silently accepts a
+    /// 1-node `a → a` as if it were acyclic. From an audit standpoint a
+    /// self-referential skill IS a reference cycle (loading "a" requires
+    /// loading "a") and the README's `SKILL005 cycle` rule promises to catch
+    /// "any cycle in the skill reference graph" — so we emit an issue for
+    /// singleton SCCs whose node has a self-loop edge as well.
     #[must_use]
     pub fn cycles(&self, skills: &[Skill]) -> Vec<Issue> {
         let mut out = Vec::new();
@@ -180,6 +191,7 @@ impl SkillGraph {
         // cycle purely via the index/README file is usually a false positive.
         let sccs = tarjan_scc(&self.graph);
         for scc in sccs {
+            // Multi-node SCC: any cycle that traverses ≥ 2 distinct skills.
             if scc.len() > 1 {
                 let ids: Vec<SkillId> = scc
                     .iter()
@@ -208,6 +220,33 @@ impl SkillGraph {
                         .with_location(Location::start_of(primary_path))
                         .with_related(related),
                 );
+                continue;
+            }
+            // Singleton SCC: only a cycle if the node has a self-edge. petgraph
+            // does NOT widen self-loop singletons into larger SCCs, so we have
+            // to inspect the outgoing edges and look for a target == source.
+            if let Some(node) = scc.first() {
+                let has_self_loop = self
+                    .graph
+                    .edges_directed(*node, petgraph::Direction::Outgoing)
+                    .any(|e| e.target() == *node);
+                if has_self_loop {
+                    let id = self
+                        .graph
+                        .node_weight(*node)
+                        .cloned()
+                        .unwrap_or_else(|| SkillId::new("?"));
+                    let path = skills
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.path.clone())
+                        .unwrap_or_else(|| id.as_str().into());
+                    let msg = format!("self-referential cycle: skill '{id}' references itself");
+                    out.push(
+                        Issue::new(IssueKind::Cycle, id, msg)
+                            .with_location(Location::start_of(path)),
+                    );
+                }
             }
         }
         out
@@ -545,6 +584,35 @@ mod tests {
         let g = SkillGraph::build(&[]);
         assert_eq!(g.out_degree(&SkillId::new("x")), 0);
         assert_eq!(g.in_degree(&SkillId::new("x")), 0);
+    }
+
+    #[test]
+    fn cycle_detects_self_loop() {
+        // A skill that mentions itself: `a/SKILL.md` containing `@a`.
+        // Tarjan SCC reports `[a]` as a singleton SCC even with the
+        // self-edge, so the previous `scc.len() > 1` filter dropped it. The
+        // self-loop branch must catch this.
+        let a = skill(
+            "a",
+            "a/SKILL.md",
+            vec![SkillRef::Mention {
+                skill_id: SkillId::new("a"),
+            }],
+        );
+        let skills = vec![a];
+        let g = SkillGraph::build(&skills);
+        let cycles = g.cycles(&skills);
+        assert_eq!(cycles.len(), 1, "self-loop should produce one cycle issue");
+        assert!(cycles[0].message.contains("self-referential"));
+    }
+
+    #[test]
+    fn cycle_does_not_flag_singleton_without_self_edge() {
+        // Plain isolated skill — no edges, no cycle.
+        let a = skill("a", "a/SKILL.md", vec![]);
+        let skills = vec![a];
+        let g = SkillGraph::build(&skills);
+        assert!(g.cycles(&skills).is_empty());
     }
 
     #[test]
