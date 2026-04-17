@@ -437,7 +437,7 @@ cargo bench --bench bench_tokenize
 
 - All collections sorted before emit.
 - Tokenizer version and schema version are stamped into every JSON/SARIF output.
-- No timestamps in default output (opt in via `SKILLDIGEST_EMIT_TIMESTAMP=1`).
+- No timestamps anywhere in the output — runs at different times produce byte-identical files.
 - Deterministic tie-breakers in the loadout recommender (integer math, no floats).
 
 ```bash

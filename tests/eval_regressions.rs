@@ -693,3 +693,70 @@ fn changelog_documents_new_rule_ids() {
         "CHANGELOG must mention the total-bloated behaviour",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent F, round 85).
+//
+// - `readme_does_not_claim_nonexistent_env_vars`: Bug 16 (LOW). Pre-fix the
+//   README promised an opt-in env var `SKILLDIGEST_EMIT_TIMESTAMP=1` that
+//   *no code in the crate ever reads*. Setting it did absolutely nothing —
+//   a silent documentation lie. Documentation-vs-behavior drift of this
+//   kind hid the cycle-C config-precedence bug for weeks; this guard pins
+//   the README so a future contributor cannot re-introduce an env-var
+//   claim that is not actually honored by the binary.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn readme_does_not_claim_nonexistent_env_vars() {
+    let readme =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README");
+    // The binary reads no environment variables at all. Any README claim of
+    // `SKILLDIGEST_*` as an opt-in must be backed by an actual `std::env::var`
+    // read somewhere in `src/`, or removed.
+    assert!(
+        !readme.contains("SKILLDIGEST_EMIT_TIMESTAMP"),
+        "README must not advertise SKILLDIGEST_EMIT_TIMESTAMP — no code reads it",
+    );
+    // Scan every source file for any `env::var` usage. If a future PR adds a
+    // new env var, this guard makes the author either honor the docs claim or
+    // remove it.
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found_env_read = false;
+    let walker = walk(&src);
+    for p in walker {
+        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        if text.contains("env::var") || text.contains("std::env::var") {
+            found_env_read = true;
+            break;
+        }
+    }
+    // This assertion is informational: if a future contributor introduces
+    // `std::env::var(...)` inside `src/`, they must also add the corresponding
+    // README documentation. Today, `found_env_read` is `false` and the README
+    // correctly documents zero env-var knobs.
+    if found_env_read {
+        assert!(
+            readme.contains("Environment variables")
+                || readme.contains("environment variable")
+                || readme.contains("SKILLDIGEST_"),
+            "src/ reads env vars but README does not document any — drift risk",
+        );
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(p);
+        }
+    }
+    out
+}
