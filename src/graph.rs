@@ -146,6 +146,14 @@ impl SkillGraph {
 
     /// Dead-skill detection: return every skill with zero in-edges that is
     /// not itself a root.
+    ///
+    /// A self-loop (skill `a` referencing itself) is NOT counted as a real
+    /// incoming reference — the README's `SKILL001 dead` rule promises to
+    /// flag any skill "never referenced by any index or other skill". A
+    /// self-reference is neither an index nor *another* skill, so a skill
+    /// whose only in-edge is its own self-loop is still logically dead. The
+    /// `SKILL005 cycle` rule will simultaneously flag the self-loop as a
+    /// separate issue.
     #[must_use]
     pub fn dead_skills(&self, skills: &[Skill]) -> Vec<Issue> {
         let mut out = Vec::new();
@@ -153,7 +161,7 @@ impl SkillGraph {
             if self.roots.contains(&skill.id) {
                 continue;
             }
-            if !self.has_in_edges(&skill.id) {
+            if !self.has_incoming_from_others(&skill.id) {
                 let mut iss = Issue::new(
                     IssueKind::Dead,
                     skill.id.clone(),
@@ -170,6 +178,18 @@ impl SkillGraph {
             }
         }
         out
+    }
+
+    /// True when the skill has at least one in-edge that is NOT a self-loop.
+    /// Used by [`Self::dead_skills`] so a skill that only references itself
+    /// still qualifies as dead.
+    fn has_incoming_from_others(&self, id: &SkillId) -> bool {
+        let Some(idx) = self.index.get(id) else {
+            return false;
+        };
+        self.graph
+            .edges_directed(*idx, petgraph::Direction::Incoming)
+            .any(|e| e.source() != *idx)
     }
 
     /// Cycle detection via Tarjan SCC. Returns one issue per SCC of size > 1

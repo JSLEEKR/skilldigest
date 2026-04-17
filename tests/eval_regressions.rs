@@ -1448,3 +1448,76 @@ fn self_loop_skill_is_flagged_as_cycle() {
         "message should label this as self-referential: {cycles:?}"
     );
 }
+
+#[test]
+fn self_loop_only_skill_is_also_flagged_dead() {
+    // Agent-M regression: a skill whose only incoming reference is its own
+    // self-loop is not reachable from any index or any *other* skill. The
+    // previous `has_in_edges` check counted the self-edge as a real incoming
+    // reference and silently suppressed the `dead` diagnostic — so an
+    // isolated self-referential file survived both `dead` and (before L) the
+    // `cycle` check. The cycle fix landed in L; this test pins the dead-fix.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    // No README / AGENTS / SKILLS index — the ONLY reference to `a` is its
+    // own self-mention inside `a/SKILL.md`.
+    std::fs::write(dir.path().join("a/SKILL.md"), b"see @a self ref").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let issues = v["issues"].as_array().unwrap();
+    let has_dead = issues
+        .iter()
+        .any(|i| i["kind"] == "dead" && i["skill"] == "a");
+    assert!(
+        has_dead,
+        "self-loop-only skill 'a' must be flagged dead: {issues:?}"
+    );
+    // Cycle is also reported (self-referential) — keeps L's fix alive.
+    let has_cycle = issues.iter().any(|i| {
+        i["kind"] == "cycle"
+            && i["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("self-referential"))
+    });
+    assert!(has_cycle, "self-loop cycle still expected: {issues:?}");
+}
+
+#[test]
+fn self_loop_with_index_ref_is_not_dead() {
+    // Guard: the dead-fix must not accidentally kill the prior behaviour
+    // where a README / index reference keeps a self-referential skill alive.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("README.md"), b"see @a").unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"see @a self ref").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let issues = v["issues"].as_array().unwrap();
+    let has_dead_a = issues
+        .iter()
+        .any(|i| i["kind"] == "dead" && i["skill"] == "a");
+    assert!(
+        !has_dead_a,
+        "a is referenced by README so must not be dead: {issues:?}"
+    );
+}
