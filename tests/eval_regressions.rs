@@ -1069,6 +1069,115 @@ fn wiki_link_pipe_alias_and_heading_anchor_together() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent J, round 85).
+//
+// - `skills_md_index_keeps_mentioned_skills_alive`: Bug 19 (HIGH). `SKILLS.md`
+//   (plural) was listed in the graph layer's `is_root_like` set but **not** in
+//   the scanner's `skill_globs`, so any library using the plural
+//   `SKILLS.md` index convention had the file silently skipped and every
+//   referenced skill flagged dead. Guard: a `SKILLS.md` index with `@a`
+//   mention keeps `a` out of the dead list.
+// - `no_dead_rust_deps_in_manifest`: Bug 20 (MEDIUM). `sha2` and `hex` were
+//   listed in `Cargo.toml` but never imported from `src/`, inflating the
+//   binary, `cargo audit` surface, and new-contributor cognitive load. Guard:
+//   the manifest must not carry deps the source does not actually use.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skills_md_index_keeps_mentioned_skills_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), "body\n").unwrap();
+    // SKILLS.md (plural) — a common index convention. Before the fix the
+    // scanner didn't pick this up, so `a` was flagged dead.
+    std::fs::write(dir.path().join("SKILLS.md"), "See @a for details\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let dead_a = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"].as_str() == Some("dead") && i["skill"].as_str() == Some("a"));
+    assert!(
+        !dead_a,
+        "a SKILLS.md index with @a mention must keep `a` out of the dead list: {stdout}"
+    );
+    // And the SKILLS.md file itself must appear as a skill with refs_out >= 1.
+    let skills_md = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["path"]
+                .as_str()
+                .map(|p| p.ends_with("SKILLS.md"))
+                .unwrap_or(false)
+        })
+        .expect("SKILLS.md in report");
+    assert!(
+        skills_md["refs_out"].as_u64().unwrap_or(0) >= 1,
+        "SKILLS.md must produce outgoing edges to the skills it mentions"
+    );
+}
+
+#[test]
+fn no_dead_rust_deps_in_manifest() {
+    // Every dep listed in Cargo.toml `[dependencies]` must be imported from
+    // at least one file under `src/`. Silent dead deps bloat the binary and
+    // inflate the `cargo audit` attack surface.
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    // Extract dep names between `[dependencies]` and the next `[` section.
+    let deps_section = manifest
+        .split_once("[dependencies]")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    let deps_block = deps_section.split("\n[").next().unwrap_or(deps_section);
+    let dep_names: Vec<String> = deps_block
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return None;
+            }
+            trimmed
+                .split_once('=')
+                .map(|(name, _)| name.trim().to_string())
+        })
+        .filter(|n| !n.is_empty() && !n.starts_with('#'))
+        .collect();
+
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = walk(&src);
+    let all_src: String = files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for dep in &dep_names {
+        let underscore = dep.replace('-', "_");
+        // Accept either `use dep::…`, `dep::` qualified usage, or `extern
+        // crate dep`. A couple of deps (`anyhow`, `thiserror`) only surface
+        // through macros (`thiserror::Error` derive, `anyhow::anyhow!`) —
+        // those still materialise in source as `thiserror::` or `anyhow!`.
+        let used = all_src.contains(&format!("{underscore}::"))
+            || all_src.contains(&format!("use {underscore}"))
+            || all_src.contains(&format!("extern crate {underscore}"))
+            || all_src.contains(&format!("{underscore}!"));
+        assert!(
+            used,
+            "Cargo.toml lists `{dep}` but no file under src/ imports it — dead dep"
+        );
+    }
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {

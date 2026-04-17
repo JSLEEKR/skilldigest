@@ -45,6 +45,12 @@ impl Default for ScanPolicy {
                 "**/AGENT.md".into(),
                 "**/agent.md".into(),
                 "**/AGENTS.md".into(),
+                // `SKILLS.md` (plural) is already recognised by the graph
+                // layer as a root-like index file, but without a matching
+                // entry here the scanner never picks it up — so every skill
+                // referenced by a `SKILLS.md` index was silently flagged
+                // dead. See graph.rs `is_root_like`.
+                "**/SKILLS.md".into(),
                 "**/CLAUDE.md".into(),
                 "**/GEMINI.md".into(),
                 "**/*.cursorrules".into(),
