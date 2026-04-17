@@ -307,6 +307,12 @@ pub enum IssueKind {
     /// that security-sensitive path-escape events are never mistaken for a
     /// routine skipped symlink note.
     PathEscape,
+    /// Aggregate library token cost exceeds the `--total-budget` cap. A
+    /// sibling of [`IssueKind::Bloated`] that applies at the library level
+    /// rather than per-skill. Without this rule the `--total-budget` CLI
+    /// flag (and the `[budget] total` config-file field) were silently
+    /// accepted but never enforced.
+    TotalBloated,
 }
 
 impl IssueKind {
@@ -325,6 +331,7 @@ impl IssueKind {
             Self::Symlink => "SKILL009",
             Self::Duplicate => "SKILL010",
             Self::PathEscape => "SKILL011",
+            Self::TotalBloated => "SKILL012",
         }
     }
 
@@ -332,9 +339,12 @@ impl IssueKind {
     #[must_use]
     pub fn default_severity(self) -> Severity {
         match self {
-            Self::Bloated | Self::Conflict | Self::Cycle | Self::Oversize | Self::Duplicate => {
-                Severity::Error
-            }
+            Self::Bloated
+            | Self::Conflict
+            | Self::Cycle
+            | Self::Oversize
+            | Self::Duplicate
+            | Self::TotalBloated => Severity::Error,
             Self::Dead | Self::Stale | Self::NonUtf8 | Self::BadFrontmatter => Severity::Warning,
             // Path escape is security-relevant but non-blocking by default:
             // users can opt into `-D` / treat-as-error in CI via severity
@@ -360,6 +370,7 @@ impl IssueKind {
             Self::Symlink => "symlink",
             Self::Duplicate => "duplicate",
             Self::PathEscape => "path-escape",
+            Self::TotalBloated => "total-bloated",
         }
     }
 }
@@ -595,6 +606,7 @@ mod tests {
             IssueKind::Symlink,
             IssueKind::Duplicate,
             IssueKind::PathEscape,
+            IssueKind::TotalBloated,
         ];
         let ids: Vec<&str> = kinds.iter().map(|k| k.rule_id()).collect();
         let mut sorted = ids.clone();

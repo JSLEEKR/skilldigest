@@ -29,6 +29,7 @@ pub fn render(report: &Report) -> Result<String> {
         IssueKind::Symlink,
         IssueKind::Duplicate,
         IssueKind::PathEscape,
+        IssueKind::TotalBloated,
     ];
     let rule_descriptions: Vec<serde_json::Value> = all_rules
         .iter()
@@ -132,6 +133,7 @@ fn rule_short(k: IssueKind) -> &'static str {
         IssueKind::Symlink => "Symlink skipped",
         IssueKind::Duplicate => "Duplicate skill identifier",
         IssueKind::PathEscape => "Path traversal outside scan root",
+        IssueKind::TotalBloated => "Library total exceeds --total-budget",
     }
 }
 
@@ -148,6 +150,7 @@ fn rule_full(k: IssueKind) -> &'static str {
         IssueKind::Symlink => "A symlink was skipped because --follow-symlinks was not set.",
         IssueKind::Duplicate => "Two or more files produced the same normalized skill identifier.",
         IssueKind::PathEscape => "A discovered file canonicalised to a path outside the scan root (typically via a symlink). The file was not analyzed. This is distinct from a routine 'symlink skipped' note and may indicate a misconfigured library layout or a malicious link.",
+        IssueKind::TotalBloated => "The aggregate token count across every skill in the library exceeds the --total-budget (or `[budget] total` config-file) cap. Consider removing dead skills, raising the cap, or splitting the library.",
     }
 }
 
@@ -202,11 +205,12 @@ mod tests {
         let s = render(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 11);
+        assert_eq!(rules.len(), 12);
         let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"SKILL001"));
         assert!(ids.contains(&"SKILL010"));
         assert!(ids.contains(&"SKILL011"));
+        assert!(ids.contains(&"SKILL012"));
     }
 
     #[test]
@@ -304,6 +308,7 @@ mod tests {
             IssueKind::Symlink,
             IssueKind::Duplicate,
             IssueKind::PathEscape,
+            IssueKind::TotalBloated,
         ] {
             assert!(!rule_short(k).is_empty());
             assert!(!rule_full(k).is_empty());

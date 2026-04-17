@@ -362,6 +362,7 @@ not to trust it for absolute billing.
 | `SKILL009` | symlink | note | Symlink skipped (use `--follow-symlinks`) |
 | `SKILL010` | duplicate | **error** | Two files produced the same normalized skill identifier |
 | `SKILL011` | path-escape | warning | Discovered file canonicalised to a path outside the scan root (e.g. via a symlink target) |
+| `SKILL012` | total-bloated | **error** | Aggregate library token cost exceeds `--total-budget` / `[budget] total` |
 
 ## CI integration (GitHub Actions)
 

@@ -381,3 +381,157 @@ fn readme_lists_path_escape_rule() {
         "README rule catalogue must describe the path-escape rule",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent C, round 85).
+//
+// - `config_budget_section_actually_applied`: Bug 8 (HIGH). The README
+//   precedence table promises `[budget] per_skill` takes effect when the CLI
+//   does not supply `--budget`, but cycles A and B shipped a CLI layer that
+//   always fabricated 2000 and beat the config silently. After the fix, the
+//   config value wins.
+// - `config_tokenizer_section_actually_applied`: Bug 9 (MEDIUM). Same class
+//   of bug for `[tokenizer] default`.
+// - `total_budget_flag_emits_total_bloated_issue`: Bug 10 (HIGH). The
+//   advertised `--total-budget` flag did nothing — no issue was ever
+//   emitted when the library total exceeded the cap. Now it produces a
+//   SKILL012 error-severity issue.
+// - `readme_lists_total_bloated_rule`: README catalogue must document
+//   SKILL012 so SARIF consumers can cross-reference it.
+// - `verbose_flag_produces_stderr_output`: Bug 11 (LOW). The `--verbose`
+//   flag was declared but never consulted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_budget_section_actually_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    // 50 repeated "word" tokens ~= well over 5 tokens.
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), "word ".repeat(50).as_bytes()).unwrap();
+    std::fs::write(
+        dir.path().join(".skilldigest.toml"),
+        "[budget]\nper_skill = 5\n",
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        v["budget"]["per_skill"].as_u64().unwrap(),
+        5,
+        "config per_skill must survive when CLI does not override",
+    );
+    let bloat = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"].as_str() == Some("bloated"));
+    assert!(
+        bloat,
+        "[budget] per_skill = 5 must be applied and trigger bloated",
+    );
+}
+
+#[test]
+fn config_tokenizer_section_actually_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"hello world\n").unwrap();
+    std::fs::write(
+        dir.path().join(".skilldigest.toml"),
+        "[tokenizer]\ndefault = \"o200k\"\n",
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        v["tokenizer"].as_str().unwrap(),
+        "o200k_base",
+        "[tokenizer] default must be honored when --tokenizer is not passed",
+    );
+}
+
+#[test]
+fn total_budget_flag_emits_total_bloated_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"hello world\n").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--total-budget",
+            "1",
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    let total_bloat: Vec<_> = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("total_bloated"))
+        .collect();
+    assert_eq!(
+        total_bloat.len(),
+        1,
+        "exactly one total_bloated issue expected; issues: {:?}",
+        v["issues"]
+    );
+    // Exit code is 1 because default_severity of TotalBloated is Error.
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn readme_lists_total_bloated_rule() {
+    let readme =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README");
+    assert!(
+        readme.contains("SKILL012"),
+        "README must document the new SKILL012 total-bloated rule",
+    );
+}
+
+#[test]
+fn verbose_flag_produces_stderr_output() {
+    let dir = tempfile::tempdir().unwrap();
+    // empty dir is enough — we only care that --verbose causes a log line.
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--verbose",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("scanning") || stderr.contains("skilldigest:"),
+        "--verbose must produce a stderr log line; got: {stderr}",
+    );
+}

@@ -42,6 +42,52 @@ pub fn effective_budget(f: &Frontmatter, budget: &BudgetConfig) -> usize {
     f.budget.unwrap_or(budget.per_skill)
 }
 
+/// Emit [`IssueKind::TotalBloated`] when the aggregate token count across
+/// the library exceeds the configured `--total-budget` cap.
+///
+/// This rule is only active when `budget.total` is `Some(_)` — users who do
+/// not set a total cap get the same zero-noise behaviour as before.
+///
+/// The issue attaches to the synthetic skill id `<library>` so SARIF
+/// consumers that group diagnostics by skill get a stable, non-colliding
+/// key. We pick the skill with the highest token cost as the primary
+/// location so the rendered `location.path` points at a concrete file (the
+/// "worst offender") rather than an empty or ambiguous path.
+#[must_use]
+pub fn total_bloated(skills: &[Skill], budget: &BudgetConfig) -> Vec<Issue> {
+    let Some(cap) = budget.total else {
+        return Vec::new();
+    };
+    let total: usize = skills.iter().map(|s| s.tokens.total).sum();
+    if total <= cap {
+        return Vec::new();
+    }
+
+    // Pick the heaviest skill as the primary location. Ties broken by skill
+    // id for determinism.
+    let worst = skills
+        .iter()
+        .max_by(|a, b| {
+            a.tokens.total.cmp(&b.tokens.total).then(b.id.cmp(&a.id)) // reverse id sort so smallest id wins ties
+        })
+        .cloned();
+
+    let mut issue = Issue::new(
+        IssueKind::TotalBloated,
+        SkillId::new("<library>"),
+        format!(
+            "library total {total} tokens exceeds --total-budget {cap} across {} skills",
+            skills.len()
+        ),
+    );
+    if let Some(w) = worst {
+        issue = issue
+            .with_location(Location::start_of(w.path.clone()))
+            .with_related(vec![w.id]);
+    }
+    vec![issue]
+}
+
 /// Conflict detection: two skills that define rules on the same subject
 /// with opposing modals.
 #[must_use]
@@ -187,6 +233,7 @@ pub fn from_parse_warnings(skills: &[Skill]) -> Vec<Issue> {
 pub fn run_all(skills: &[Skill], graph: &SkillGraph, budget: &BudgetConfig) -> Vec<Issue> {
     let mut issues = Vec::new();
     issues.extend(bloated(skills, budget));
+    issues.extend(total_bloated(skills, budget));
     issues.extend(conflicts(skills));
     issues.extend(stale(skills));
     issues.extend(duplicates(skills));
@@ -444,5 +491,44 @@ mod tests {
     #[test]
     fn normalise_subject_strips_quotes() {
         assert_eq!(normalise_subject("\"Rm\""), "rm");
+    }
+
+    #[test]
+    fn total_bloated_none_when_cap_absent() {
+        let mut a = mk_skill("a", 1000);
+        a.tokens = TokenCounts::new(0, 1000);
+        let budget = BudgetConfig {
+            per_skill: 10_000,
+            total: None,
+        };
+        assert!(total_bloated(&[a], &budget).is_empty());
+    }
+
+    #[test]
+    fn total_bloated_none_when_under_cap() {
+        let mut a = mk_skill("a", 100);
+        a.tokens = TokenCounts::new(0, 100);
+        let budget = BudgetConfig {
+            per_skill: 10_000,
+            total: Some(200),
+        };
+        assert!(total_bloated(&[a], &budget).is_empty());
+    }
+
+    #[test]
+    fn total_bloated_emits_when_over_cap() {
+        let mut a = mk_skill("a", 500);
+        a.tokens = TokenCounts::new(0, 500);
+        let mut b = mk_skill("b", 700);
+        b.tokens = TokenCounts::new(0, 700);
+        let budget = BudgetConfig {
+            per_skill: 10_000,
+            total: Some(1000),
+        };
+        let out = total_bloated(&[a, b], &budget);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, IssueKind::TotalBloated);
+        // Worst offender should be surfaced in the related list.
+        assert_eq!(out[0].related[0].as_str(), "b");
     }
 }

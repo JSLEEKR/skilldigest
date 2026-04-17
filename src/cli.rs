@@ -34,16 +34,24 @@ pub struct Cli {
     /// Write output to this file instead of stdout.
     #[arg(long, short = 'o', global = true)]
     pub output: Option<PathBuf>,
-    /// Tokenizer: cl100k, o200k, llama3.
-    #[arg(long, short = 't', global = true, default_value = "cl100k")]
-    pub tokenizer: String,
-    /// Per-skill token budget.
-    #[arg(long, short = 'b', global = true, default_value_t = 2000)]
-    pub budget: usize,
-    /// Aggregate token budget.
+    /// Tokenizer: cl100k, o200k, llama3. Falls back to the
+    /// `.skilldigest.toml` `[tokenizer] default` value when unset, and to
+    /// `cl100k` when neither is set.
+    #[arg(long, short = 't', global = true)]
+    pub tokenizer: Option<String>,
+    /// Per-skill token budget. Falls back to the `.skilldigest.toml`
+    /// `[budget] per_skill` value when unset, and to `2000` when neither is
+    /// set.
+    #[arg(long, short = 'b', global = true)]
+    pub budget: Option<usize>,
+    /// Aggregate token budget across the whole library. When unset, falls
+    /// back to the `.skilldigest.toml` `[budget] total` value. Exceeding
+    /// this cap emits a SKILL012 `total-bloated` issue.
     #[arg(long, global = true)]
     pub total_budget: Option<usize>,
-    /// Force fully offline mode (never touch the filesystem cache).
+    /// No-op retained for forward compatibility — skilldigest is always
+    /// fully offline (tokenizer data is bundled inside the binary and the
+    /// tool never performs network I/O at scan time).
     #[arg(long, global = true)]
     pub offline: bool,
     /// Follow symlinks during scan.
@@ -69,6 +77,13 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 }
+
+/// Default per-skill token budget when neither the CLI nor the config file
+/// sets one. Matches the value documented in the README.
+pub const DEFAULT_PER_SKILL_BUDGET: usize = 2000;
+
+/// Default tokenizer when neither the CLI nor the config file sets one.
+pub const DEFAULT_TOKENIZER: &str = "cl100k";
 
 /// Subcommands.
 #[derive(Subcommand, Debug)]
@@ -125,7 +140,37 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 fn build_options(cli: &Cli, dir: &std::path::Path) -> Result<AuditOptions> {
-    let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&cli.tokenizer)?;
+    // Load config up-front so we can honor the documented precedence:
+    //   1. CLI flag
+    //   2. Frontmatter `budget:`            (inside `rules::effective_budget`)
+    //   3. `[overrides]` section
+    //   4. `[budget]` / `[tokenizer]` section
+    //   5. Built-in default
+    // Without pre-loading the config here the CLI layer previously supplied a
+    // hard-coded default of 2000 tokens / `cl100k` which then beat every
+    // config value silently — the README precedence table was effectively a
+    // lie for anyone who shipped a `.skilldigest.toml`.
+    let config_path = cli.config.clone().or_else(|| config::find_default(dir));
+    let doc: Option<crate::config::ConfigDoc> = if let Some(ref path) = config_path {
+        config::load(path)?
+    } else {
+        None
+    };
+
+    let per_skill = cli
+        .budget
+        .or_else(|| doc.as_ref().map(|d| d.budget.per_skill))
+        .unwrap_or(DEFAULT_PER_SKILL_BUDGET);
+    let total_budget = cli
+        .total_budget
+        .or_else(|| doc.as_ref().and_then(|d| d.budget.total));
+    let tokenizer_name = cli
+        .tokenizer
+        .clone()
+        .or_else(|| doc.as_ref().and_then(|d| d.tokenizer.default.clone()))
+        .unwrap_or_else(|| DEFAULT_TOKENIZER.to_string());
+
+    let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&tokenizer_name)?;
     let policy = ScanPolicy {
         follow_symlinks: cli.follow_symlinks,
         max_file_size: cli.max_file_size,
@@ -136,18 +181,26 @@ fn build_options(cli: &Cli, dir: &std::path::Path) -> Result<AuditOptions> {
         root: dir.to_path_buf(),
         tokenizer,
         budget: BudgetConfig {
-            per_skill: cli.budget,
-            total: cli.total_budget,
+            per_skill,
+            total: total_budget,
         },
         policy,
         overrides: BTreeMap::new(),
     };
 
-    let config_path = cli.config.clone().or_else(|| config::find_default(dir));
-    if let Some(path) = config_path {
-        if let Some(doc) = config::load(&path)? {
-            options.apply_config(&doc);
-        }
+    if let Some(ref d) = doc {
+        options.apply_config(d);
+    }
+
+    if cli.verbose {
+        eprintln!(
+            "skilldigest: scanning {} with tokenizer={} per_skill_budget={} total_budget={:?} config={:?}",
+            dir.display(),
+            options.tokenizer.name(),
+            options.budget.per_skill,
+            options.budget.total,
+            config_path,
+        );
     }
     Ok(options)
 }
@@ -181,7 +234,31 @@ fn tokens_cmd(
     by_section: bool,
     format: Format,
 ) -> Result<ExitCode> {
-    let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&cli.tokenizer)?;
+    // Honor the config-file `[tokenizer] default` even for the `tokens`
+    // subcommand (which does not go through `build_options`). Config discovery
+    // uses the parent directory of the target file.
+    let config_parent = cli
+        .config
+        .clone()
+        .or_else(|| file.parent().and_then(config::find_default));
+    let tokenizer_name: String = cli
+        .tokenizer
+        .clone()
+        .or_else(|| {
+            config_parent
+                .as_deref()
+                .and_then(|p| config::load(p).ok().flatten())
+                .and_then(|d| d.tokenizer.default)
+        })
+        .unwrap_or_else(|| DEFAULT_TOKENIZER.to_string());
+    let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&tokenizer_name)?;
+    if cli.verbose {
+        eprintln!(
+            "skilldigest: tokens {} (tokenizer={})",
+            file.display(),
+            tokenizer.name()
+        );
+    }
     let bytes = fs::read(file).map_err(|e| Error::io(file, e))?;
     let parsed = crate::parse::parse_bytes(&bytes, file);
     // When not splitting by section, tokenize the *original* UTF-8 text
@@ -234,7 +311,7 @@ fn tokens_cmd(
                 total_skills: 1,
                 total_tokens: frontmatter_tokens + body_tokens,
                 budget: BudgetConfig {
-                    per_skill: cli.budget,
+                    per_skill: cli.budget.unwrap_or(DEFAULT_PER_SKILL_BUDGET),
                     total: cli.total_budget,
                 },
                 skills: vec![],
@@ -406,8 +483,8 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(cli.format, "json");
-        assert_eq!(cli.tokenizer, "o200k");
-        assert_eq!(cli.budget, 3000);
+        assert_eq!(cli.tokenizer.as_deref(), Some("o200k"));
+        assert_eq!(cli.budget, Some(3000));
     }
 
     #[test]
