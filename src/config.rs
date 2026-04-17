@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// Top-level TOML document.
+///
+/// `deny_unknown_fields` is intentional: every silent typo in a user's
+/// `.skilldigest.toml` eventually shows up as "why isn't my budget being
+/// applied?" cycle-C-style bug report. Rejecting unknown keys up front keeps
+/// config drift from masquerading as silently-broken behaviour.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigDoc {
     /// Budget section.
     #[serde(default)]
@@ -30,6 +36,7 @@ pub struct ConfigDoc {
 
 /// Budget section.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetSection {
     /// Per-skill budget (tokens).
     #[serde(default = "default_per_skill")]
@@ -54,6 +61,7 @@ fn default_per_skill() -> usize {
 
 /// Tokenizer section.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenizerSection {
     /// Tokenizer name ("cl100k", "o200k", "llama3").
     #[serde(default)]
@@ -62,6 +70,7 @@ pub struct TokenizerSection {
 
 /// Ignore section.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct IgnoreSection {
     /// Glob patterns to skip.
     #[serde(default)]
@@ -70,6 +79,7 @@ pub struct IgnoreSection {
 
 /// Per-skill override.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillOverride {
     /// Custom budget for this specific skill.
     #[serde(default)]

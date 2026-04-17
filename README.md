@@ -90,7 +90,7 @@ SARIF report your CI already knows how to upload.
 - **Fast** — ~1,400 skills in < 2 s on an 8-core laptop (rayon parallel tokenization).
 - **Multi-format** — text, JSON, SARIF 2.1, Markdown (PR comment), GraphViz dot.
 - **Library-format agnostic** — detects `SKILL.md`, `AGENT.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.cursorrules`, `.cursor/rules/**`, `.claude/skills/**`, `plugin.toml`.
-- **Rule catalogue** — 11 distinct issue classes with SARIF `ruleId`s (`SKILL001`–`SKILL011`).
+- **Rule catalogue** — 12 distinct issue classes with SARIF `ruleId`s (`SKILL001`–`SKILL012`).
 - **Robust** — tolerates BOM, CRLF, mixed indent, malformed frontmatter, non-UTF-8 bytes.
 - **Configurable** — `.skilldigest.toml` with per-skill budget overrides and ignore globs.
 - **Zero `unsafe`** — `#![forbid(unsafe_code)]` at the crate root.
@@ -264,7 +264,7 @@ Pretty-printed; stable snake_case keys; versioned via `schema_version`.
 
 The SARIF emitter is designed to be accepted by GitHub code-scanning
 (`github/codeql-action/upload-sarif@v3`). Each issue class has its own rule
-(`SKILL001` – `SKILL011`) with stable `id`, `name`, `shortDescription`,
+(`SKILL001` – `SKILL012`) with stable `id`, `name`, `shortDescription`,
 `fullDescription`, `defaultConfiguration.level`, and `helpUri`.
 
 ```bash

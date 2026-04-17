@@ -535,3 +535,161 @@ fn verbose_flag_produces_stderr_output() {
         "--verbose must produce a stderr log line; got: {stderr}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent D, round 85).
+//
+// - `config_rejects_unknown_top_level_field`: Bug 12 (MEDIUM). Silent
+//   acceptance of unknown config keys hid the cycle-C bug for weeks (users
+//   thought their `[budget] per_skill = 5` was taking effect when in fact the
+//   whole section was being ignored). `deny_unknown_fields` now rejects
+//   `bogus_field = 1` up front with a clear error.
+// - `config_rejects_unknown_nested_field`: same, but for nested sections
+//   (catches typos like `per_skil` inside `[budget]`).
+// - `unreadable_file_does_not_abort_scan`: Bug 13 (MEDIUM). A single
+//   permission-denied skill used to abort the entire scan with exit 2 (an
+//   operational error). It now emits a non-fatal `symlink`-kind note and
+//   processes every other file, reserving exit 2 for CLI-level errors.
+// - `readme_mentions_twelve_rules`: Bug 14 (LOW). `README.md` claimed 11
+//   distinct issue classes (and cited `SKILL001`–`SKILL011`) in two places
+//   even though cycle C added `SKILL012` total-bloated.
+// - `changelog_documents_new_rule_ids`: Bug 15 (LOW). CHANGELOG.md was stuck
+//   on the original cycle-0 feature list and did not reflect SKILL011 /
+//   SKILL012 or the behavioural fixes from cycles A–C.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_unknown_top_level_field() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".skilldigest.toml"),
+        "bogus_field = 42\n[budget]\nper_skill = 100\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"body").unwrap();
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--no-color"])
+        .output()
+        .expect("run scan");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown top-level config field must produce an operational (exit 2) config error, \
+         got stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bogus_field") || stderr.contains("unknown field"),
+        "config error must name the offending field; got: {stderr}",
+    );
+}
+
+#[test]
+fn config_rejects_unknown_nested_field() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".skilldigest.toml"),
+        "[budget]\nper_skil = 123\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"body").unwrap();
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--no-color"])
+        .output()
+        .expect("run scan");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown nested config field must fail; stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unreadable_file_does_not_abort_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let good = dir.path().join("good/SKILL.md");
+    let bad = dir.path().join("bad/SKILL.md");
+    std::fs::create_dir_all(good.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&good, b"readable body").unwrap();
+    std::fs::write(&bad, b"unreadable body").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+
+    // Restore permissions before asserting so tempdir cleanup succeeds even
+    // when the assertion fails.
+    let _ = std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644));
+
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(0) | Some(1)),
+        "per-file read failure must NOT return operational exit 2; got {code:?}; stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // The readable skill must still make it into the report.
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    let skill_ids: Vec<&str> = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        skill_ids.contains(&"good"),
+        "scan must continue past an unreadable file; ids: {skill_ids:?}"
+    );
+}
+
+#[test]
+fn readme_mentions_twelve_rules() {
+    let readme =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README");
+    assert!(
+        !readme.contains("11 distinct issue classes"),
+        "README still claims 11 issue classes but SKILL012 has been added",
+    );
+    assert!(
+        !readme.contains("(`SKILL001`–`SKILL011`)")
+            && !readme.contains("(`SKILL001` – `SKILL011`)"),
+        "README must cite the full SKILL001–SKILL012 range",
+    );
+    assert!(
+        readme.contains("SKILL012"),
+        "README rule catalogue must include SKILL012",
+    );
+}
+
+#[test]
+fn changelog_documents_new_rule_ids() {
+    let log =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("CHANGELOG.md"))
+            .expect("read CHANGELOG");
+    assert!(
+        log.contains("SKILL011") && log.contains("SKILL012"),
+        "CHANGELOG must document the path-escape (SKILL011) and total-bloated (SKILL012) rules",
+    );
+    assert!(
+        log.contains("total-bloated") || log.contains("total_bloated"),
+        "CHANGELOG must mention the total-bloated behaviour",
+    );
+}

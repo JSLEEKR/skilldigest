@@ -175,10 +175,27 @@ pub fn scan_dir(root: &Path, policy: &ScanPolicy) -> Result<ScanOutput> {
             continue;
         }
 
+        // Per-file metadata / read failures are converted into non-fatal
+        // `Symlink`-kind notes rather than aborting the entire scan with an
+        // operational error (exit 2). A single unreadable skill (for example,
+        // a file the invoking user lacks permission on) would otherwise mask
+        // every other issue in the library and surface as a CLI-level
+        // infrastructure failure. Distinguishing per-file errors from CLI
+        // errors keeps exit code 2 reserved for truly global problems like
+        // missing scan roots or bad flags.
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                return Err(Error::io(entry.path(), std::io::Error::from(e)));
+                let rel_id = SkillId::new(rel.to_string_lossy().as_ref());
+                output.issues.push(
+                    Issue::new(
+                        IssueKind::Symlink,
+                        rel_id,
+                        format!("metadata read failed for {}: {e}", rel.display()),
+                    )
+                    .with_location(Location::start_of(rel.clone())),
+                );
+                continue;
             }
         };
         let size = meta.len();
@@ -200,7 +217,18 @@ pub fn scan_dir(root: &Path, policy: &ScanPolicy) -> Result<ScanOutput> {
 
         let bytes = match fs::read(entry.path()) {
             Ok(b) => b,
-            Err(e) => return Err(Error::io(entry.path(), e)),
+            Err(e) => {
+                let rel_id = SkillId::new(rel.to_string_lossy().as_ref());
+                output.issues.push(
+                    Issue::new(
+                        IssueKind::Symlink,
+                        rel_id,
+                        format!("file read failed for {}: {e}", rel.display()),
+                    )
+                    .with_location(Location::start_of(rel.clone())),
+                );
+                continue;
+            }
         };
 
         output.files.push(DiscoveredFile {
