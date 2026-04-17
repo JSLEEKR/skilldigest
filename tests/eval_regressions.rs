@@ -1521,3 +1521,96 @@ fn self_loop_with_index_ref_is_not_dead() {
         "a is referenced by README so must not be dead: {issues:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bug 8 (MEDIUM, cycle N): the per-skill `issue_kinds` rollup folded in any
+// issue where the skill appeared in `related`. For `dead` issues that list
+// is a set of *index/root* files (not other dead skills), so every README /
+// SKILLS.md / AGENTS.md ended up tagged with `dead` in the JSON summary and
+// showed a "dead" row in the Markdown PR-comment table. Index files are by
+// definition never dead, so this was a highly visible false positive on
+// real-world libraries.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn root_index_does_not_inherit_dead_kind_from_related() {
+    // Layout: README.md acts as the root. `live/` is referenced from the
+    // README; `dead/` is not. The graph emits one `Dead` issue for
+    // `dead` with `related: [""]` (the README skill id, which normalises to
+    // the empty string when the README sits at the scan root). Before the
+    // fix, the rollup flagged the README's `issue_kinds` as `["dead"]` even
+    // though the README is itself a root.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("live")).unwrap();
+    std::fs::create_dir_all(dir.path().join("dead")).unwrap();
+    std::fs::write(dir.path().join("README.md"), b"# Index\n\nSee @live\n").unwrap();
+    std::fs::write(dir.path().join("live/SKILL.md"), b"live body").unwrap();
+    std::fs::write(dir.path().join("dead/SKILL.md"), b"dead body").unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    assert!(output.status.success() || output.status.code() == Some(1));
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+
+    // Collect every skill whose summary carries `dead`. Only the actually-
+    // dead skill (`dead`) may qualify; the README root (which lives at the
+    // scan root and thus has skill id `""`) must NOT inherit the kind.
+    let skills = v["skills"].as_array().unwrap();
+    let dead_summary_ids: Vec<String> = skills
+        .iter()
+        .filter(|s| {
+            s["issue_kinds"]
+                .as_array()
+                .map(|arr| arr.iter().any(|k| k.as_str() == Some("dead")))
+                .unwrap_or(false)
+        })
+        .map(|s| s["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        dead_summary_ids,
+        vec!["dead".to_string()],
+        "only the actually-dead skill may carry `dead` in issue_kinds; \
+         the README root must not inherit the kind via the `related` rollup; \
+         got {dead_summary_ids:?}"
+    );
+}
+
+#[test]
+fn dead_issue_rollup_still_fires_for_the_dead_skill() {
+    // Complement to the previous test: fix must NOT regress the dead skill's
+    // own summary (the dead skill is the primary, not via related).
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("dead")).unwrap();
+    std::fs::write(dir.path().join("dead/SKILL.md"), b"nobody references me").unwrap();
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let skills = v["skills"].as_array().unwrap();
+    let dead_row = skills
+        .iter()
+        .find(|s| s["id"] == "dead")
+        .expect("dead skill present");
+    let kinds = dead_row["issue_kinds"].as_array().unwrap();
+    assert!(
+        kinds.iter().any(|k| k.as_str() == Some("dead")),
+        "dead skill must still carry the `dead` kind via the primary filter; got {kinds:?}"
+    );
+}

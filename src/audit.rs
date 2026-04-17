@@ -143,9 +143,21 @@ pub fn run(options: AuditOptions) -> Result<Report> {
             // `issue_kinds: []` in the JSON summary, which misleads UIs and
             // the PR-comment markdown table into thinking only one skill is
             // involved.
+            //
+            // `Dead` is excluded from the `related` rollup because its
+            // `related` field carries a different semantic: it lists the
+            // *root/index files* that failed to reference the dead skill, not
+            // other skills that share the same problem. Rolling up via
+            // `related` therefore wrongly tagged the README / SKILLS.md index
+            // nodes with `dead` in the per-skill summary, which then appeared
+            // as "dead" rows in the Markdown PR-comment table — a highly
+            // visible false positive on every library that uses an index file
+            // alongside at least one unreachable skill.
             let issue_kinds: BTreeSet<IssueKind> = issues
                 .iter()
-                .filter(|i| i.skill == s.id || i.related.contains(&s.id))
+                .filter(|i| {
+                    i.skill == s.id || (i.kind != IssueKind::Dead && i.related.contains(&s.id))
+                })
                 .map(|i| i.kind)
                 .collect();
             SkillSummary {
