@@ -695,6 +695,68 @@ fn changelog_documents_new_rule_ids() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent G, round 85).
+//
+// - `wiki_link_mention_creates_reference_edge`: Bug 17 (HIGH). README and spec
+//   both document `[[wiki-style]]` mentions as a supported form of skill
+//   reference. In practice pulldown-cmark splits `[[foo]]` into five separate
+//   Text events (`[`, `[`, `foo`, `]`, `]`) so the event-driven scanner never
+//   observed the full `[[foo]]` string. Every wiki-link was silently dropped,
+//   which meant any skill referenced ONLY via wiki-links was erroneously
+//   flagged as dead. Fix: run an additional raw-body scan for wiki links.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wiki_link_mention_creates_reference_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a/SKILL.md");
+    let target = dir.path().join("target-skill/SKILL.md");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&a, "---\nname: a\n---\nReference to [[target-skill]].\n").unwrap();
+    std::fs::write(&target, "---\nname: target\n---\nbody\n").unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).expect("valid json");
+
+    // target-skill must have an incoming edge from a.
+    let target_summary = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("target-skill"))
+        .expect("target-skill present in report");
+    assert!(
+        target_summary["refs_in"].as_u64().unwrap() >= 1,
+        "wiki-link [[target-skill]] must produce an incoming ref on target-skill; \
+         summary={target_summary}"
+    );
+
+    // And target-skill must NOT be flagged dead.
+    let dead_ids: Vec<&str> = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("dead"))
+        .map(|i| i["skill"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !dead_ids.contains(&"target-skill"),
+        "skill referenced via wiki link must not be flagged dead; dead={dead_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Regression tests added by the independent evaluator (Agent F, round 85).
 //
 // - `readme_does_not_claim_nonexistent_env_vars`: Bug 16 (LOW). Pre-fix the

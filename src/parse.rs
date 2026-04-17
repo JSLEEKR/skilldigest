@@ -275,6 +275,15 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         }
     }
 
+    // Wiki-link extraction must also run against the raw body, because
+    // pulldown-cmark splits `[[...]]` across separate Text events (one each
+    // for `[`, `[`, `inner`, `]`, `]`) — so the per-event `scan_mentions_and_files`
+    // call above never observes the full `[[inner]]` string. Running a second
+    // pass on the raw body captures wiki-links without double-counting
+    // @mentions (the raw scan collects both, but dedup below absorbs the
+    // duplicates).
+    scan_wiki_links_raw(body, &mut refs);
+
     // Rule extraction works line-by-line on the raw body, but must NOT
     // trigger inside fenced code blocks. Sample/documentation code frequently
     // contains "MUST NOT use X" style examples that are not themselves rules
@@ -450,6 +459,37 @@ fn scan_mentions_and_files(text: &str, refs: &mut Vec<SkillRef>) {
 
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Scan raw body text for `[[wiki]]` style mentions that pulldown-cmark's
+/// event stream splits across multiple Text events. The event-driven scanner
+/// sees `[`, `[`, `inner`, `]`, `]` as five separate Text events, so the
+/// `[[...]]` branch in [`scan_mentions_and_files`] never fires in practice.
+///
+/// Running a raw-text pass guarantees wiki-link mentions are captured. The
+/// deduplication step in [`extract_refs_and_rules`] absorbs any duplicates
+/// introduced by the combined approach.
+fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            if let Some(rel) = text[start..].find("]]") {
+                let inner = &text[start..start + rel];
+                // Reject multi-line or space-containing inners — those are
+                // almost certainly prose, not a wiki link.
+                if !inner.is_empty() && !inner.contains(' ') && !inner.contains('\n') {
+                    refs.push(SkillRef::Mention {
+                        skill_id: SkillId::new(inner),
+                    });
+                }
+                i = start + rel + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
 }
 
 fn extract_rule_from_line(line: &str, line_number: usize) -> Option<Rule> {
