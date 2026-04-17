@@ -463,6 +463,12 @@ fn scan_mentions_and_files(text: &str, refs: &mut Vec<SkillRef>) {
 /// Supports Obsidian-style `[[target|display text]]` aliases by returning
 /// only the `target` portion. Everything after the first `|` is treated as
 /// the human-facing display label and ignored for reference resolution.
+///
+/// Also strips an optional `#heading` anchor: `[[foo#usage]]` resolves to the
+/// `foo` skill id rather than the (unresolvable) `foo#usage` literal. Without
+/// this strip, authors who deep-link into a section heading (an idiom
+/// Obsidian / Dendron / many wiki tools bake in) had their cross-references
+/// silently dropped and the target skill wrongly flagged dead.
 fn wiki_link_target(inner: &str) -> Option<&str> {
     if inner.is_empty() || inner.contains('\n') {
         return None;
@@ -472,6 +478,8 @@ fn wiki_link_target(inner: &str) -> Option<&str> {
     // a space inside the target is almost certainly prose rather than a
     // wiki link.
     let target = inner.split('|').next().unwrap_or("").trim();
+    // Strip `#heading` anchor. `[[foo#sec]]` still resolves to `foo`.
+    let target = target.split('#').next().unwrap_or("").trim_end();
     if target.is_empty() || target.contains(char::is_whitespace) {
         return None;
     }
@@ -763,6 +771,19 @@ mod tests {
         assert!(refs.iter().any(
             |r| matches!(r, SkillRef::Mention { skill_id } if skill_id.as_str() == "foo-bar")
         ));
+    }
+
+    #[test]
+    fn wiki_link_target_strips_heading_anchor() {
+        assert_eq!(wiki_link_target("foo#usage"), Some("foo"));
+        assert_eq!(wiki_link_target("foo#usage|display"), Some("foo"));
+        assert_eq!(wiki_link_target("foo|display#not-an-anchor"), Some("foo"));
+    }
+
+    #[test]
+    fn wiki_link_target_rejects_anchor_only() {
+        // `[[#section]]` is a same-page anchor — no skill id to resolve.
+        assert_eq!(wiki_link_target("#section"), None);
     }
 
     #[test]

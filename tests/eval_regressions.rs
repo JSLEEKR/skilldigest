@@ -994,6 +994,81 @@ fn broken_pipe_exits_cleanly_not_as_operational_error() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent I, round 85).
+//
+// - `wiki_link_heading_anchor_resolves_to_target`: Bug 18 (HIGH). Obsidian /
+//   Dendron / many note-taking tools let authors deep-link into a section of
+//   a document via `[[skill#heading]]`. Before the cycle-I fix the raw scan
+//   captured the mention as the literal `skill#heading` string, which never
+//   matched any skill id. Result: every deep link silently dropped, and the
+//   target skill was wrongly reported as dead. Guard: a `[[foo#usage]]`
+//   mention MUST resolve to skill id `foo` and keep it out of the dead list.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wiki_link_heading_anchor_resolves_to_target() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        "See [[foo#usage]] for details\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), "body\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let issues = v["issues"].as_array().unwrap();
+    for issue in issues {
+        assert!(
+            !(issue["kind"].as_str() == Some("dead") && issue["skill"].as_str() == Some("foo")),
+            "heading-anchor target 'foo' wrongly flagged dead: {stdout}"
+        );
+    }
+    // And `foo` must pick up at least one incoming edge.
+    let foo = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("foo"))
+        .expect("foo in report");
+    assert!(
+        foo["refs_in"].as_u64().unwrap_or(0) >= 1,
+        "wiki-link with heading anchor must produce a refs_in edge on target; summary={foo}"
+    );
+}
+
+#[test]
+fn wiki_link_pipe_alias_and_heading_anchor_together() {
+    // Belt-and-braces: `[[target#heading|display]]` must resolve to `target`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        "See [[foo#usage|pretty label]] for details\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("foo/SKILL.md"), "body\n").unwrap();
+
+    let output = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    for issue in v["issues"].as_array().unwrap() {
+        assert!(
+            !(issue["kind"].as_str() == Some("dead") && issue["skill"].as_str() == Some("foo")),
+            "pipe+anchor target 'foo' wrongly flagged dead: {stdout}"
+        );
+    }
+}
+
 fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
