@@ -29,7 +29,22 @@ pub trait Tokenizer: Send + Sync + std::fmt::Debug {
     /// Count tokens in the given string. This is the hot path — callers
     /// prefer this over `encode` so we avoid allocating the token vector.
     fn count(&self, text: &str) -> usize;
+    /// Pinned implementation version string, embedded into every emitted
+    /// report so downstream consumers can detect silent BPE/tokenizer drift.
+    /// Combines the library crate identifier with the logical tokenizer name,
+    /// e.g. `"tiktoken-rs 0.7 cl100k_base"`.
+    fn version(&self) -> String {
+        format!("{} {}", IMPL_TAG, self.name())
+    }
 }
+
+/// Identifier for the library backing our BPE tokenizers. Bump in lockstep
+/// with the `tiktoken-rs` dependency in `Cargo.toml`.
+pub const IMPL_TAG: &str = "tiktoken-rs 0.7";
+
+/// Identifier for the approximate llama3 tokenizer, which is entirely in-tree
+/// rather than backed by `tiktoken-rs`.
+pub const LLAMA3_IMPL_TAG: &str = "skilldigest-llama3-approx 1";
 
 /// Construct a tokenizer from a user-facing name. Accepts `cl100k`,
 /// `cl100k_base`, `o200k`, `o200k_base`, `llama3`, `llama-3`.
@@ -138,6 +153,10 @@ impl Llama3Approx {
 impl Tokenizer for Llama3Approx {
     fn name(&self) -> &'static str {
         "llama3_approx"
+    }
+
+    fn version(&self) -> String {
+        format!("{} {}", LLAMA3_IMPL_TAG, self.name())
     }
 
     fn count(&self, text: &str) -> usize {

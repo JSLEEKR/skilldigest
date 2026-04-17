@@ -98,6 +98,7 @@ mod tests {
         Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 1,
@@ -170,6 +171,7 @@ mod tests {
         let r = Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 0,

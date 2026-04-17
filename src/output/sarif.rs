@@ -28,6 +28,7 @@ pub fn render(report: &Report) -> Result<String> {
         IssueKind::BadFrontmatter,
         IssueKind::Symlink,
         IssueKind::Duplicate,
+        IssueKind::PathEscape,
     ];
     let rule_descriptions: Vec<serde_json::Value> = all_rules
         .iter()
@@ -108,6 +109,7 @@ pub fn render(report: &Report) -> Result<String> {
             "properties": {
                 "schema_version": report.schema_version,
                 "tokenizer": report.tokenizer,
+                "tokenizer_version": report.tokenizer_version,
                 "total_skills": report.total_skills,
                 "total_tokens": report.total_tokens,
             }
@@ -129,6 +131,7 @@ fn rule_short(k: IssueKind) -> &'static str {
         IssueKind::BadFrontmatter => "Frontmatter could not be parsed",
         IssueKind::Symlink => "Symlink skipped",
         IssueKind::Duplicate => "Duplicate skill identifier",
+        IssueKind::PathEscape => "Path traversal outside scan root",
     }
 }
 
@@ -144,6 +147,7 @@ fn rule_full(k: IssueKind) -> &'static str {
         IssueKind::BadFrontmatter => "The YAML frontmatter at the top of the file failed to parse. The rest of the file was still analyzed.",
         IssueKind::Symlink => "A symlink was skipped because --follow-symlinks was not set.",
         IssueKind::Duplicate => "Two or more files produced the same normalized skill identifier.",
+        IssueKind::PathEscape => "A discovered file canonicalised to a path outside the scan root (typically via a symlink). The file was not analyzed. This is distinct from a routine 'symlink skipped' note and may indicate a misconfigured library layout or a malicious link.",
     }
 }
 
@@ -158,6 +162,7 @@ mod tests {
         Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k_base".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k_base".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 1,
@@ -197,10 +202,11 @@ mod tests {
         let s = render(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 11);
         let ids: Vec<&str> = rules.iter().map(|r| r["id"].as_str().unwrap()).collect();
         assert!(ids.contains(&"SKILL001"));
         assert!(ids.contains(&"SKILL010"));
+        assert!(ids.contains(&"SKILL011"));
     }
 
     #[test]
@@ -223,6 +229,7 @@ mod tests {
         let r = Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k_base".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k_base".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 0,
@@ -260,6 +267,7 @@ mod tests {
         let r = Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 2,
@@ -295,6 +303,7 @@ mod tests {
             IssueKind::BadFrontmatter,
             IssueKind::Symlink,
             IssueKind::Duplicate,
+            IssueKind::PathEscape,
         ] {
             assert!(!rule_short(k).is_empty());
             assert!(!rule_full(k).is_empty());

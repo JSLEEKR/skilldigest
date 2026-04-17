@@ -153,11 +153,15 @@ pub fn scan_dir(root: &Path, policy: &ScanPolicy) -> Result<ScanOutput> {
         };
 
         // Path traversal guard — canonicalize and verify we stay under root.
+        // Emit a dedicated `PathEscape` diagnostic rather than reusing
+        // `Symlink`, because "your symlink target lives outside the scan
+        // root" is a security-relevant event that must not be confused with
+        // a routine "symlink skipped" note.
         if let Ok(canonical) = fs::canonicalize(entry.path()) {
             if !canonical.starts_with(&canonical_root) {
                 output.issues.push(
                     Issue::new(
-                        IssueKind::Symlink,
+                        IssueKind::PathEscape,
                         SkillId::new(rel.to_string_lossy().as_ref()),
                         format!("path escapes scan root: {}", rel.display()),
                     )

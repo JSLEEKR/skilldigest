@@ -301,6 +301,12 @@ pub enum IssueKind {
     Symlink,
     /// Duplicate skill IDs in the library.
     Duplicate,
+    /// A discovered file canonicalised to a path outside the scan root. This
+    /// can happen when `--follow-symlinks` is enabled and a symlink targets a
+    /// directory above the scan root. Distinct from [`IssueKind::Symlink`] so
+    /// that security-sensitive path-escape events are never mistaken for a
+    /// routine skipped symlink note.
+    PathEscape,
 }
 
 impl IssueKind {
@@ -318,6 +324,7 @@ impl IssueKind {
             Self::BadFrontmatter => "SKILL008",
             Self::Symlink => "SKILL009",
             Self::Duplicate => "SKILL010",
+            Self::PathEscape => "SKILL011",
         }
     }
 
@@ -329,6 +336,11 @@ impl IssueKind {
                 Severity::Error
             }
             Self::Dead | Self::Stale | Self::NonUtf8 | Self::BadFrontmatter => Severity::Warning,
+            // Path escape is security-relevant but non-blocking by default:
+            // users can opt into `-D` / treat-as-error in CI via severity
+            // overrides. We emit at Warning so it is visible in the normal
+            // report without breaking the build unconditionally.
+            Self::PathEscape => Severity::Warning,
             Self::Symlink => Severity::Note,
         }
     }
@@ -347,6 +359,7 @@ impl IssueKind {
             Self::BadFrontmatter => "bad-frontmatter",
             Self::Symlink => "symlink",
             Self::Duplicate => "duplicate",
+            Self::PathEscape => "path-escape",
         }
     }
 }
@@ -468,8 +481,13 @@ pub struct Loadout {
 pub struct Report {
     /// Schema version constant — helps consumers pin behaviour.
     pub schema_version: &'static str,
-    /// Tokenizer identifier actually used for counting.
+    /// Tokenizer identifier actually used for counting (e.g. `cl100k_base`).
     pub tokenizer: String,
+    /// Pinned tokenizer implementation version, embedded into every emission
+    /// so downstream consumers can detect BPE drift. Combines the library
+    /// crate identifier with the logical tokenizer name, e.g.
+    /// `"tiktoken-rs 0.7 cl100k_base"`.
+    pub tokenizer_version: String,
     /// Tool version.
     pub tool_version: &'static str,
     /// Scan root path (relative or absolute — as given by user).
@@ -576,6 +594,7 @@ mod tests {
             IssueKind::BadFrontmatter,
             IssueKind::Symlink,
             IssueKind::Duplicate,
+            IssueKind::PathEscape,
         ];
         let ids: Vec<&str> = kinds.iter().map(|k| k.rule_id()).collect();
         let mut sorted = ids.clone();
@@ -632,6 +651,7 @@ mod tests {
         let report = Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k".to_string(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".to_string(),
             tool_version: crate::VERSION,
             scan_root: PathBuf::from("."),
             total_skills: 1,

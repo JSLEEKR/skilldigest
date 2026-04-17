@@ -80,7 +80,7 @@ fn sarif_rules_have_all_required_fields() {
     let v: serde_json::Value =
         serde_json::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
     let rules = v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
-    assert_eq!(rules.len(), 10);
+    assert_eq!(rules.len(), 11);
     for rule in rules {
         assert!(rule["id"].is_string());
         assert!(rule["name"].is_string());

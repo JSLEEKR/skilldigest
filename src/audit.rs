@@ -157,6 +157,7 @@ pub fn run(options: AuditOptions) -> Result<Report> {
     let report = Report {
         schema_version: crate::SCHEMA_VERSION,
         tokenizer: options.tokenizer.name().to_string(),
+        tokenizer_version: options.tokenizer.version(),
         tool_version: crate::VERSION,
         scan_root: options.root,
         total_skills: skills.len(),
@@ -237,6 +238,7 @@ pub fn run_graph(options: AuditOptions) -> Result<(Report, SkillGraph)> {
     let report = Report {
         schema_version: crate::SCHEMA_VERSION,
         tokenizer: options.tokenizer.name().to_string(),
+        tokenizer_version: options.tokenizer.version(),
         tool_version: crate::VERSION,
         scan_root: root,
         total_skills: skills.len(),

@@ -184,22 +184,25 @@ fn tokens_cmd(
     let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&cli.tokenizer)?;
     let bytes = fs::read(file).map_err(|e| Error::io(file, e))?;
     let parsed = crate::parse::parse_bytes(&bytes, file);
+    // When not splitting by section, tokenize the *original* UTF-8 text
+    // directly (including the `---` delimiters) rather than concatenating the
+    // already-stripped frontmatter and body — the latter drops the markers
+    // and gives a slightly different count than the file as a whole.
+    let whole_text = String::from_utf8_lossy(&bytes);
     let (frontmatter_tokens, body_tokens) = if by_section {
         (
             tokenizer.count(&parsed.frontmatter_raw),
             tokenizer.count(&parsed.body),
         )
     } else {
-        (
-            0,
-            tokenizer.count(&format!("{}{}", parsed.frontmatter_raw, parsed.body)),
-        )
+        (0, tokenizer.count(&whole_text))
     };
 
     let rendered = match format {
         Format::Json => serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": crate::SCHEMA_VERSION,
             "tokenizer": tokenizer.name(),
+            "tokenizer_version": tokenizer.version(),
             "tool_version": crate::VERSION,
             "file": file.to_string_lossy(),
             "frontmatter": frontmatter_tokens,
@@ -218,6 +221,7 @@ fn tokens_cmd(
             let shim = crate::model::Report {
                 schema_version: crate::SCHEMA_VERSION,
                 tokenizer: tokenizer.name().to_string(),
+                tokenizer_version: tokenizer.version(),
                 tool_version: crate::VERSION,
                 scan_root: file.to_path_buf(),
                 total_skills: 1,
@@ -444,6 +448,7 @@ mod tests {
         let report = crate::model::Report {
             schema_version: crate::SCHEMA_VERSION,
             tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
             tool_version: crate::VERSION,
             scan_root: ".".into(),
             total_skills: 1,

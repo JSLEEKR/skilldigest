@@ -275,8 +275,44 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         }
     }
 
-    // Rule extraction works line-by-line on the raw body.
+    // Rule extraction works line-by-line on the raw body, but must NOT
+    // trigger inside fenced code blocks. Sample/documentation code frequently
+    // contains "MUST NOT use X" style examples that are not themselves rules
+    // the skill is asserting — picking them up produces false-positive
+    // conflict issues that block CI builds without cause.
+    let mut in_fence = false;
+    let mut fence_marker: Option<String> = None;
     for (i, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        // Recognise both ```...``` and ~~~...~~~ fences. A fence opens with 3+
+        // backticks or tildes; it closes with a matching run of the same
+        // character (length ≥ opening).
+        let fence_kind = if trimmed.starts_with("```") {
+            Some('`')
+        } else if trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(ch) = fence_kind {
+            let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
+            if in_fence {
+                // Only close if the marker matches (same char, ≥ opening len).
+                if let Some(open) = &fence_marker {
+                    if run.chars().all(|c| c == ch) && run.len() >= open.len() {
+                        in_fence = false;
+                        fence_marker = None;
+                    }
+                }
+            } else {
+                in_fence = true;
+                fence_marker = Some(run);
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if let Some(rule) = extract_rule_from_line(line, i + 1) {
             rules.push(rule);
         }
