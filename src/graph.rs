@@ -406,9 +406,21 @@ fn resolve_link_to_skill_id(
     }
     let canonical: std::path::PathBuf = components.iter().collect();
     let s = canonical.to_string_lossy().replace('\\', "/");
+    // The suffix list here MUST stay in lockstep with `parse::derive_skill_id`.
+    // When the two functions strip different sets of skill filename
+    // conventions, a markdown link `[x](./foo/AGENT.md)` resolves to the id
+    // `foo/AGENT` while the actual skill (parsed from the same file) gets the
+    // id `foo` — producing a phantom target that is never in the index, no
+    // incoming edge on the real skill, and a spurious `dead` flag on every
+    // skill whose reachability depends on a markdown link through one of these
+    // filenames. Singular `AGENT.md` / `agent.md` were missing from this list
+    // before; they are honored by `derive_skill_id`, so every link into an
+    // AGENT.md-backed skill silently dropped.
     let id = s
         .strip_suffix("/SKILL.md")
         .or_else(|| s.strip_suffix("/skill.md"))
+        .or_else(|| s.strip_suffix("/AGENT.md"))
+        .or_else(|| s.strip_suffix("/agent.md"))
         .or_else(|| s.strip_suffix("/README.md"))
         .or_else(|| s.strip_suffix("/AGENTS.md"))
         .or_else(|| s.strip_suffix("/index.md"))
@@ -542,6 +554,24 @@ mod tests {
         let to = std::path::Path::new("../baz.md");
         let id = resolve_link_to_skill_id(from, to).unwrap();
         assert_eq!(id.as_str(), "baz");
+    }
+
+    #[test]
+    fn link_resolves_agent_md_like_derive_skill_id() {
+        // Must stay in lockstep with `parse::derive_skill_id`: both strip
+        // `/AGENT.md` and `/agent.md` so a markdown link into an AGENT.md
+        // skill produces the same id the parser assigned.
+        let from = std::path::Path::new("README.md");
+        let to_upper = std::path::Path::new("foo/AGENT.md");
+        let to_lower = std::path::Path::new("foo/agent.md");
+        assert_eq!(
+            resolve_link_to_skill_id(from, to_upper).unwrap().as_str(),
+            "foo"
+        );
+        assert_eq!(
+            resolve_link_to_skill_id(from, to_lower).unwrap().as_str(),
+            "foo"
+        );
     }
 
     #[test]

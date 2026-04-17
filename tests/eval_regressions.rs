@@ -1614,3 +1614,107 @@ fn dead_issue_rollup_still_fires_for_the_dead_skill() {
         "dead skill must still carry the `dead` kind via the primary filter; got {kinds:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent O, round 85,
+// cycle 15).
+//
+// - `markdown_link_to_agent_md_resolves_to_skill_id`: Bug O1 (MEDIUM). The
+//   scanner picks up `AGENT.md` (singular) and `agent.md` files, and
+//   `parse::derive_skill_id` strips both `/AGENT.md` and `/agent.md` so a
+//   file at `foo/AGENT.md` yields the skill id `foo`. But the sibling
+//   function `graph::resolve_link_to_skill_id` (used when a markdown link
+//   like `[x](./foo/AGENT.md)` is walked) did NOT strip either of those
+//   suffixes, so the link resolved to the phantom id `foo/AGENT` — which is
+//   never in the index. The skill therefore picked up zero incoming edges
+//   from markdown links and was wrongly flagged dead. `@foo` mentions still
+//   worked because they look up the id directly. Fix: align the strip list
+//   in `resolve_link_to_skill_id` with `derive_skill_id`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn markdown_link_to_agent_md_resolves_to_skill_id() {
+    // A skill stored as `foo/AGENT.md` whose only inbound reference is a
+    // markdown link from the README. Before the fix the link resolved to the
+    // phantom id `foo/AGENT`, missed the real `foo` skill, and `foo` was
+    // wrongly flagged `dead`.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(dir.path().join("foo/AGENT.md"), b"body\n").unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"See [foo](./foo/AGENT.md) for details\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+
+    let foo = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("foo"))
+        .expect("foo skill present");
+    assert!(
+        foo["refs_in"].as_u64().unwrap() >= 1,
+        "markdown link `./foo/AGENT.md` must produce a refs_in edge on `foo`; summary={foo}"
+    );
+    let dead = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"].as_str() == Some("dead") && i["skill"].as_str() == Some("foo"));
+    assert!(
+        !dead,
+        "skill referenced via markdown link to AGENT.md must not be dead: {stdout}"
+    );
+}
+
+#[test]
+fn markdown_link_to_agent_md_lowercase_resolves_to_skill_id() {
+    // Same bug class for lowercase `agent.md` — both variants live in the
+    // scanner's glob set and in `derive_skill_id`'s strip list. Both must
+    // resolve via markdown links.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(dir.path().join("foo/agent.md"), b"body\n").unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"See [foo](./foo/agent.md) for details\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let foo = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("foo"))
+        .expect("foo skill present");
+    assert!(
+        foo["refs_in"].as_u64().unwrap() >= 1,
+        "markdown link `./foo/agent.md` must produce a refs_in edge on `foo`; summary={foo}"
+    );
+}
