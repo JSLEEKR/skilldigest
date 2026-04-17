@@ -1,0 +1,11 @@
+/target
+Cargo.lock.bak
+*.bk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+/.harness/
+/.eval-notes-*.md
+/.cache/

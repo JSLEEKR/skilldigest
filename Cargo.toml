@@ -1,0 +1,69 @@
+[package]
+name = "skilldigest"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["JSLEEKR <93jslee@gmail.com>"]
+description = "Static analyzer for AI agent skill libraries. Finds dead/bloated/conflicting skills, counts tokens, gates CI. Single Rust binary."
+license = "MIT"
+repository = "https://github.com/JSLEEKR/skilldigest"
+homepage = "https://github.com/JSLEEKR/skilldigest"
+readme = "README.md"
+keywords = ["ai", "skills", "tokens", "static-analysis", "sarif"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [".eval-notes-*.md", ".harness/", "ROUND_LOG.md", "fixtures/huge-synthetic/"]
+
+[lib]
+name = "skilldigest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skilldigest"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+thiserror = "1.0"
+anyhow = "1.0"
+walkdir = "2.5"
+globset = "0.4"
+pulldown-cmark = { version = "0.12", default-features = false }
+petgraph = { version = "0.6", default-features = false, features = ["stable_graph"] }
+rayon = "1.10"
+simdutf8 = "0.1"
+tiktoken-rs = "0.7"
+# Used for deterministic hashing of skill ids and config cache keys
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"
+criterion = { version = "0.5", default-features = false }
+# For SARIF schema shape validation (self-contained JSON parse checks)
+
+[[bench]]
+name = "bench_tokenize"
+harness = false
+
+[[bench]]
+name = "bench_scan"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[package.metadata.docs.rs]
+all-features = true
