@@ -150,6 +150,20 @@ fn build_options(cli: &Cli, dir: &std::path::Path) -> Result<AuditOptions> {
     // hard-coded default of 2000 tokens / `cl100k` which then beat every
     // config value silently — the README precedence table was effectively a
     // lie for anyone who shipped a `.skilldigest.toml`.
+    // When the user passes `--config <path>` explicitly, the path MUST exist.
+    // Silently falling back to defaults on a typo (the previous behaviour)
+    // produces "why isn't my config being applied?" bug reports — the same
+    // category of footgun that motivated `deny_unknown_fields` on the toml
+    // schema. Auto-discovery via `config::find_default` already filters by
+    // `is_file()` so it cannot hit this branch with a bogus path.
+    if let Some(ref explicit) = cli.config {
+        if !explicit.is_file() {
+            return Err(Error::Config {
+                path: explicit.clone(),
+                message: "config file does not exist (or is not a regular file)".to_string(),
+            });
+        }
+    }
     let config_path = cli.config.clone().or_else(|| config::find_default(dir));
     let doc: Option<crate::config::ConfigDoc> = if let Some(ref path) = config_path {
         config::load(path)?
@@ -237,6 +251,19 @@ fn tokens_cmd(
     // Honor the config-file `[tokenizer] default` even for the `tokens`
     // subcommand (which does not go through `build_options`). Config discovery
     // uses the parent directory of the target file.
+    //
+    // An explicit `--config <path>` must point at an existing file; silently
+    // falling back to defaults on a typo would mismatch the `scan` /
+    // `loadout` / `graph` precedent and re-open the same footgun the
+    // `deny_unknown_fields` change closed for unknown TOML keys.
+    if let Some(ref explicit) = cli.config {
+        if !explicit.is_file() {
+            return Err(Error::Config {
+                path: explicit.clone(),
+                message: "config file does not exist (or is not a regular file)".to_string(),
+            });
+        }
+    }
     let config_parent = cli
         .config
         .clone()

@@ -1193,3 +1193,94 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent K, round 85,
+// cycle 11).
+//
+// `explicit_config_missing_file_fails_loudly`: Bug K1 (MEDIUM). Passing
+//   `--config <path>` where the file does not exist used to be silently
+//   accepted as if no config had been provided at all, returning exit 0 with
+//   default values. A typo in the path therefore disabled the user's
+//   carefully-tuned budgets / overrides without warning. The fix rejects
+//   missing explicit config files with exit 2 and a `Config` error so the
+//   user notices immediately.
+// `explicit_config_missing_file_fails_loudly_for_tokens`: same bug surfaced
+//   on the `tokens` subcommand, which goes through its own config-loading
+//   path and shared the silent-fallback hazard.
+// `explicit_config_pointing_at_dir_is_rejected`: a directory whose name
+//   matches the explicit `--config` argument must also be rejected — only a
+//   regular file is acceptable.
+
+#[test]
+fn explicit_config_missing_file_fails_loudly() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), b"body").unwrap();
+    let bogus = dir.path().join("does-not-exist.toml");
+    let output = Command::new(bin())
+        .args([
+            "--config",
+            bogus.to_str().unwrap(),
+            "scan",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "explicit --config <missing> must exit 2; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config") && stderr.contains("does not exist"),
+        "stderr should mention the missing config: {stderr}"
+    );
+}
+
+#[test]
+fn explicit_config_missing_file_fails_loudly_for_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.md");
+    std::fs::write(&file, b"body").unwrap();
+    let bogus = dir.path().join("does-not-exist.toml");
+    let output = Command::new(bin())
+        .args([
+            "--config",
+            bogus.to_str().unwrap(),
+            "tokens",
+            file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "explicit --config <missing> on `tokens` must exit 2; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn explicit_config_pointing_at_dir_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.md"), b"body").unwrap();
+    // Pass the scan-root directory itself as `--config` — it exists, but as
+    // a directory not a regular file. Must be rejected with exit 2.
+    let output = Command::new(bin())
+        .args([
+            "--config",
+            dir.path().to_str().unwrap(),
+            "scan",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "directory passed as --config must exit 2; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
