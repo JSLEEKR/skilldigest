@@ -36,16 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokenizer, ignore-globs, and per-skill overrides. Unknown keys are
   rejected up front with a clear error message so typos never silently
   disable a rule. Config values apply transitively to the `scan`, `tokens`,
-  `loadout`, and `graph` subcommands. Documented precedence (highest wins):
-  CLI flag → frontmatter `budget:` → `[overrides]` → `[budget]` → built-in
-  default.
+  `loadout`, and `graph` subcommands. Documented precedence (highest wins,
+  most-specific override beats more-global setting): frontmatter `budget:`
+  → `[overrides]` (per-skill, by id) → `--budget` CLI flag (sets the global
+  per-skill default for the run) → `[budget] per_skill` config section →
+  built-in default. The same shape applies to the aggregate `[budget]
+  total` cap: `--total-budget` overrides `[budget] total`; there is no
+  per-skill override for the aggregate.
 - Global flags `--verbose` / `-v` (stderr log line with the active
   tokenizer, budget, and config file) and `--offline` (documented no-op
   retained for forward compatibility — skilldigest never performs network
   I/O at scan time because tokenizer data is bundled in the binary).
 - Rule-extraction parser ignores any `MUST` / `MUST NOT` prefix that
-  appears inside a fenced code block (` ``` ` or `~~~`) so sample /
-  documentation snippets do not produce false-positive conflict issues.
+  appears inside a fenced code block (` ``` ` or `~~~`) **or** a CommonMark
+  indented code block (a line preceded by a blank line and indented by 4+
+  spaces or a tab) so sample / documentation snippets do not produce
+  false-positive conflict issues.
 - Per-file metadata / read failures now emit a warning-level issue and
   continue rather than aborting the entire scan with operational exit
   code 2, reserving exit 2 for genuine CLI-level errors (bad scan root,

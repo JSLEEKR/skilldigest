@@ -2088,3 +2088,135 @@ fn eval_t_structural_conflicts_still_detected_after_prose_fallback_removal() {
         "backtick-quoted shared subject must still produce a `conflict` issue: {stdout}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent U, round 85).
+//
+// - `eval_u_indented_code_block_rules_are_ignored`: Bug U1 (MEDIUM). Eval-A
+//   added fenced-code-block (` ``` `, `~~~`) skip for the rule extractor so
+//   sample/documentation MUST/MUST NOT examples don't surface as real rules
+//   and produce false-positive `conflict` diagnostics. CommonMark also
+//   recognises the (older) **indented code block**: a line preceded by a
+//   blank line and indented by 4+ spaces or a tab. The fenced-block fix
+//   missed that variant entirely, so any skill library that documents
+//   do/don't examples in indented blocks tripped the same exact CI-blocking
+//   false positive the fenced fix was supposed to close. Both forms are
+//   ubiquitous in Markdown — the indented form predates fences.
+// - `eval_u_changelog_precedence_matches_readme`: Bug U2 (LOW). The eval-Q
+//   fix corrected the README precedence list to match the actual evaluation
+//   order (frontmatter > overrides > CLI > config > default), but
+//   `CHANGELOG.md` still carried the old `CLI > frontmatter > overrides >
+//   [budget] > default` ordering — the same documentation-vs-behavior lie
+//   the eval-Q fix was meant to retire. Two doc files now disagree about
+//   precedence; users who read either authoritative source come away with
+//   an incorrect mental model of which budget actually wins.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn eval_u_indented_code_block_rules_are_ignored() {
+    // Two skills that contain MUST / MUST NOT lines inside a CommonMark
+    // indented code block (4-space prefix preceded by a blank line). Before
+    // the fix this produced a false-positive `conflict` issue on the shared
+    // subject, exactly the same way fenced code blocks did before eval-A.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    std::fs::write(
+        &a,
+        "---\nname: a\n---\n# A\n\nHere is sample code:\n\n    MUST use `git rebase`\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        &b,
+        "---\nname: b\n---\n# B\n\nHere is sample code:\n\n    MUST NOT use `git rebase`\n",
+    )
+    .expect("write b");
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        conflicts.is_empty(),
+        "rules inside CommonMark indented code blocks must not produce a `conflict` \
+         issue (parallel to the fenced-block skip from eval-A): {conflicts:?}",
+    );
+}
+
+#[test]
+fn eval_u_indented_code_block_does_not_swallow_following_paragraph_rule() {
+    // Guard: a paragraph (no leading indent) AFTER an indented block must
+    // still produce its rule. Catches an over-aggressive "in-code-block"
+    // sticky state that would mistake the post-code prose for code too.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    std::fs::write(
+        &a,
+        "---\nname: a\n---\n# A\n\n    sample = 1\n\nMUST use `git rebase`.\n",
+    )
+    .expect("write a");
+    std::fs::write(&b, "---\nname: b\n---\n# B\n\nMUST NOT use `git rebase`.\n").expect("write b");
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        !conflicts.is_empty(),
+        "post-code paragraph rule must still fire and collide with skill b: {stdout}",
+    );
+}
+
+#[test]
+fn eval_u_changelog_precedence_matches_readme() {
+    // Doc-vs-doc parity: README and CHANGELOG must agree about which budget
+    // source wins. README was corrected by eval-Q to read
+    // `frontmatter > overrides > CLI > config > default`. CHANGELOG kept the
+    // old `CLI > frontmatter > overrides > [budget] > default` ordering,
+    // re-introducing the exact documentation lie eval-Q was meant to retire.
+    let log = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("CHANGELOG.md"),
+    )
+    .expect("read CHANGELOG.md");
+    // The CHANGELOG must NOT show the old (wrong) `CLI flag → frontmatter`
+    // ordering: that was the eval-C / eval-Q lie.
+    assert!(
+        !log.contains("CLI flag → frontmatter"),
+        "CHANGELOG still shows the old (wrong) `CLI flag → frontmatter` precedence; \
+         actual code resolves frontmatter before CLI. Update CHANGELOG to match the \
+         eval-Q-corrected README list.",
+    );
+}

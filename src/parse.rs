@@ -291,6 +291,7 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
     // conflict issues that block CI builds without cause.
     let mut in_fence = false;
     let mut fence_marker: Option<String> = None;
+    let mut prev_blank = true; // Treat the start of body as if preceded by blank.
     for (i, line) in body.lines().enumerate() {
         let trimmed = line.trim_start();
         // Recognise both ```...``` and ~~~...~~~ fences. A fence opens with 3+
@@ -317,14 +318,29 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
                 in_fence = true;
                 fence_marker = Some(run);
             }
+            prev_blank = false;
             continue;
         }
         if in_fence {
+            prev_blank = trimmed.is_empty();
             continue;
         }
-        if let Some(rule) = extract_rule_from_line(line, i + 1) {
-            rules.push(rule);
+        // CommonMark indented code block: a line with 4+ leading spaces (or a
+        // tab) preceded by a blank line is treated as code, not paragraph
+        // text. Sample / how-to documentation frequently shows MUST/MUST NOT
+        // examples this way (the syntax predates fenced blocks). Picking
+        // those up produces the same class of false-positive `conflict`
+        // issue that the fenced-block skip already prevents — see eval-A for
+        // the fenced equivalent. Detecting this requires tracking the
+        // previous line's blankness, since a continuation line of an ongoing
+        // paragraph that happens to be deeply indented is NOT a code block.
+        let is_indented_code = prev_blank && is_indented_code_line(line);
+        if !is_indented_code {
+            if let Some(rule) = extract_rule_from_line(line, i + 1) {
+                rules.push(rule);
+            }
         }
+        prev_blank = trimmed.is_empty();
     }
 
     refs.sort_by_key(|r| format!("{r:?}"));
@@ -550,6 +566,28 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
         }
         i += 1;
     }
+}
+
+/// True when `line` looks like an indented code-block line per CommonMark:
+/// 4+ leading spaces or a leading tab, and at least one non-whitespace
+/// character. Empty / whitespace-only lines are excluded so that blank
+/// separators between code blocks don't themselves count as code.
+fn is_indented_code_line(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let mut spaces = 0usize;
+    for b in line.bytes() {
+        match b {
+            b' ' => spaces += 1,
+            b'\t' => return true,
+            _ => break,
+        }
+        if spaces >= 4 {
+            return true;
+        }
+    }
+    spaces >= 4
 }
 
 fn extract_rule_from_line(line: &str, line_number: usize) -> Option<Rule> {
@@ -915,6 +953,45 @@ mod tests {
         // why the previous "first word" fallback was a footgun.
         assert!(extract_subject("foo bar baz").is_none());
         assert!(extract_subject("the system properly").is_none());
+    }
+
+    #[test]
+    fn is_indented_code_line_recognises_four_space_prefix() {
+        assert!(is_indented_code_line("    let x = 1;"));
+        assert!(is_indented_code_line("\tlet x = 1;"));
+        assert!(is_indented_code_line("    MUST use `git rebase`"));
+        assert!(!is_indented_code_line("   only three spaces"));
+        assert!(!is_indented_code_line(""));
+        assert!(!is_indented_code_line("    "));
+        assert!(!is_indented_code_line("regular paragraph"));
+    }
+
+    #[test]
+    fn indented_code_block_rule_skipped_when_preceded_by_blank() {
+        // CommonMark indented code: blank line then 4+ space indent. The
+        // `MUST use foo` inside the block must NOT create a Rule. Without
+        // the fix this picked up `Rule { subject: "foo" }` and the conflict
+        // detector would happily collide it against a real prose rule
+        // elsewhere in the library.
+        let body = "Sample:\n\n    MUST use `foo`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.is_empty(),
+            "indented-code MUST line must not extract as a rule; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn indented_paragraph_continuation_still_extracts_rule() {
+        // Without a preceding blank line, indented text is a paragraph
+        // continuation, not a code block. (Today the rule extractor treats
+        // such lines as text — we confirm we did not over-skip them.)
+        let body = "First line.\n    MUST use `bar`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            !rules.is_empty(),
+            "indented continuation (no blank above) is paragraph text — rule must still fire"
+        );
     }
 
     #[test]
