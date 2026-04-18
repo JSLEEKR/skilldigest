@@ -1767,3 +1767,99 @@ fn output_to_file_matches_stdout_redirect_byte_for_byte() {
         "file output must end with a trailing newline (POSIX text-file convention)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent Q, round 85).
+//
+// - `markdown_link_to_agents_md_plural_resolves_to_skill_id`: Bug Q1 (LOW).
+//   The eval-O fix added singular `/AGENT.md` and `/agent.md` to the link
+//   resolver but left the plural `/AGENTS.md` strip in place. Since
+//   `parse::derive_skill_id` does not strip plural AGENTS.md, the two
+//   functions disagreed: the file `foo/AGENTS.md` parsed to id `foo/AGENTS`
+//   while a markdown link to it resolved to the phantom id `foo`. Every
+//   cross-reference into an AGENTS.md-backed skill therefore silently
+//   dropped. Fix: remove `/AGENTS.md` from the resolver so both functions
+//   honor the same suffix-strip set. The lockstep contract the file's own
+//   comment promises is now actually enforced by tests.
+// - `readme_precedence_table_documents_actual_behaviour`: Bug Q2 (LOW). The
+//   `## Configuration file` precedence list in the README claimed
+//   `1. CLI flag > 2. Frontmatter > 3. [overrides] > 4. [budget]`. The
+//   actual code resolves per-skill effective budget as
+//   `frontmatter > [overrides] > CLI > [budget]` (more-specific overrides
+//   beat more-global settings). The previous list was a doc-vs-code
+//   contract violation that mirrored exactly the cycle-C class of bug it
+//   was meant to forestall. Fix: re-order the README list to match the
+//   code (per-file overrides win) and clarify that `--budget` sets the
+//   *global per-skill default* for the run, not a hard cap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn markdown_link_to_agents_md_plural_resolves_to_skill_id() {
+    // Layout: README.md links to `foo/AGENTS.md`. The parser assigns
+    // `foo/AGENTS.md` the id `foo/AGENTS` (no strip — AGENTS.md plural is not
+    // in `derive_skill_id`'s strip list). Before eval-Q the resolver stripped
+    // `/AGENTS.md`, resolving the link to a phantom `foo`, dropping the
+    // incoming edge, and (crucially) skewing the `refs_in` count on the real
+    // skill to 0. Both functions must agree.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("foo")).unwrap();
+    std::fs::write(dir.path().join("foo/AGENTS.md"), b"body\n").unwrap();
+    std::fs::write(
+        dir.path().join("README.md"),
+        b"See [foo](./foo/AGENTS.md) for details\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run scan");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let target = v["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"].as_str() == Some("foo/AGENTS"))
+        .expect("foo/AGENTS skill present");
+    assert!(
+        target["refs_in"].as_u64().unwrap() >= 1,
+        "markdown link `./foo/AGENTS.md` must produce a refs_in edge on `foo/AGENTS`; summary={target}"
+    );
+}
+
+#[test]
+fn readme_precedence_table_documents_actual_behaviour() {
+    // Lock the README precedence list to the actual evaluation order. The
+    // test reads README.md verbatim and asserts the list starts with
+    // frontmatter (the most-specific override) rather than the CLI flag.
+    // Catches the documentation regressing back to the eval-C wording, which
+    // promised CLI > frontmatter even though the implementation has always
+    // been frontmatter > CLI for the per-skill budget.
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README.md");
+    let table_idx = readme
+        .find("Precedence (highest wins)")
+        .expect("precedence header present");
+    let after = &readme[table_idx..];
+    // The first numbered item must mention frontmatter, not "CLI flag".
+    let first_item_idx = after.find("1. ").expect("ordered list present");
+    let first_item = &after[first_item_idx..first_item_idx + 80];
+    assert!(
+        first_item.to_ascii_lowercase().contains("frontmatter"),
+        "README precedence #1 must be frontmatter (most specific) — got: {first_item}"
+    );
+    // The list must not mislead users into thinking the CLI flag overrides
+    // per-skill frontmatter — keep that nuance intact.
+    assert!(
+        !after[..200].starts_with("Precedence (highest wins):\n\n1. CLI flag"),
+        "README precedence list must not regress to the eval-C wording where CLI was #1"
+    );
+}

@@ -325,13 +325,17 @@ budget = 3000
 budget = 5000
 ```
 
-Precedence (highest wins):
+Precedence (highest wins) — most-specific override beats more-global setting:
 
-1. CLI flag
-2. Frontmatter `budget:` on an individual skill
-3. `[overrides]` section
-4. `[budget]` section
+1. Frontmatter `budget:` on an individual skill (most specific)
+2. `[overrides]` section in `.skilldigest.toml` (per-skill, by id)
+3. `--budget` CLI flag (sets the global per-skill default for this run)
+4. `[budget] per_skill` config section
 5. Built-in default (2000)
+
+The same shape applies to the global `[budget] total` cap: `--total-budget`
+on the CLI overrides `[budget] total` in the config file. There is no
+per-skill override for the aggregate cap.
 
 ## Tokenizers
 

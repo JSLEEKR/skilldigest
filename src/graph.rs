@@ -414,15 +414,23 @@ fn resolve_link_to_skill_id(
     // incoming edge on the real skill, and a spurious `dead` flag on every
     // skill whose reachability depends on a markdown link through one of these
     // filenames. Singular `AGENT.md` / `agent.md` were missing from this list
-    // before; they are honored by `derive_skill_id`, so every link into an
-    // AGENT.md-backed skill silently dropped.
+    // before eval-O; they are honored by `derive_skill_id`, so every link into
+    // an AGENT.md-backed skill silently dropped.
+    //
+    // `/AGENTS.md` (plural) is intentionally NOT in this list, because
+    // `parse::derive_skill_id` does not strip it either: the file
+    // `git/AGENTS.md` keeps the id `git/AGENTS` (not `git`). Stripping it here
+    // would re-introduce the lockstep mismatch in the opposite direction —
+    // markdown links into `git/AGENTS.md` would resolve to the phantom id
+    // `git` instead of the real `git/AGENTS`, dropping every cross-reference
+    // to an AGENTS.md-backed file. The eval-O fix added the singular forms
+    // but left the plural mismatch; eval-Q removes it.
     let id = s
         .strip_suffix("/SKILL.md")
         .or_else(|| s.strip_suffix("/skill.md"))
         .or_else(|| s.strip_suffix("/AGENT.md"))
         .or_else(|| s.strip_suffix("/agent.md"))
         .or_else(|| s.strip_suffix("/README.md"))
-        .or_else(|| s.strip_suffix("/AGENTS.md"))
         .or_else(|| s.strip_suffix("/index.md"))
         .map(|t| t.to_string())
         .unwrap_or_else(|| {
@@ -571,6 +579,22 @@ mod tests {
         assert_eq!(
             resolve_link_to_skill_id(from, to_lower).unwrap().as_str(),
             "foo"
+        );
+    }
+
+    #[test]
+    fn link_resolves_agents_md_plural_like_derive_skill_id() {
+        // Lockstep regression for eval-Q: `parse::derive_skill_id` does NOT
+        // strip `/AGENTS.md` (plural), so the file `foo/AGENTS.md` keeps the
+        // id `foo/AGENTS`. The resolver previously stripped `/AGENTS.md`,
+        // resolving links to a phantom `foo` and silently dropping every
+        // cross-reference into an AGENTS.md-backed file. Both functions must
+        // now agree.
+        let from = std::path::Path::new("README.md");
+        let to = std::path::Path::new("foo/AGENTS.md");
+        assert_eq!(
+            resolve_link_to_skill_id(from, to).unwrap().as_str(),
+            "foo/AGENTS"
         );
     }
 
