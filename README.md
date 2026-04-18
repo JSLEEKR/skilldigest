@@ -150,7 +150,7 @@ skilldigest graph ./my-skills --format dot | dot -Tsvg > skills.svg
 | `-t, --tokenizer <NAME>` | `cl100k` | Tokenizer: `cl100k`, `o200k`, `llama3` |
 | `-b, --budget <N>` | `2000` | Per-skill token budget |
 | `--total-budget <N>` | none | Aggregate token budget across the library |
-| `--offline` | off | Force fully offline (no cache reads/writes) |
+| `--offline` | off | No-op retained for forward compatibility — skilldigest is always fully offline (tokenizer data is bundled in the binary; no network I/O at scan time) |
 | `--follow-symlinks` | off | Follow symlinks during scan |
 | `--max-file-size <B>` | `1048576` | Skip files larger than this many bytes |
 | `--config <FILE>` | auto | Path to `.skilldigest.toml` |

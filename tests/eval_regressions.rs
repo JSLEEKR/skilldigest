@@ -1863,3 +1863,41 @@ fn readme_precedence_table_documents_actual_behaviour() {
         "README precedence list must not regress to the eval-C wording where CLI was #1"
     );
 }
+
+#[test]
+fn readme_offline_flag_described_as_noop() {
+    // Bug (eval-R, LOW): the README's global-flags table previously claimed
+    //
+    //     | `--offline` | off | Force fully offline (no cache reads/writes) |
+    //
+    // which is misleading on two counts:
+    //   1. skilldigest has no cache to "force" the flag to bypass.
+    //   2. The CLI doc-comment (and the CHANGELOG) document the flag as a
+    //      no-op retained for forward compatibility — there is no behaviour
+    //      to "force".
+    //
+    // Without an explicit "this flag does nothing" disclosure, users believe
+    // turning the flag on is a meaningful security/privacy posture toggle.
+    // It is not. Lock the README so the description either calls the flag a
+    // no-op or quotes the CLI's exact wording, matching the CHANGELOG entry.
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("read README.md");
+    let row_idx = readme
+        .find("`--offline`")
+        .expect("--offline row present in README global-flags table");
+    let row_end = readme[row_idx..]
+        .find('\n')
+        .map(|n| row_idx + n)
+        .unwrap_or(readme.len());
+    let row = &readme[row_idx..row_end];
+    let lower = row.to_ascii_lowercase();
+    assert!(
+        lower.contains("no-op") || lower.contains("no op") || lower.contains("noop"),
+        "README must describe --offline as a no-op (matches CLI doc-comment + CHANGELOG); got: {row}"
+    );
+    assert!(
+        !lower.contains("force fully offline (no cache"),
+        "README must not regress to the misleading 'Force fully offline (no cache reads/writes)' wording; got: {row}"
+    );
+}
