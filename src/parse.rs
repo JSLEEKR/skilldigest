@@ -694,6 +694,19 @@ fn is_word_byte(b: u8) -> bool {
 fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
     let mut in_fence = false;
     let mut fence_marker: Option<String> = None;
+    // Mirror the indented-code-block tracking from `extract_refs_and_rules`
+    // (eval-U / eval-Z lockstep). A `[[wiki-link]]` that lives inside a
+    // CommonMark §4.4 indented code block — 4+ leading spaces or a tab,
+    // preceded by a blank line OR an ATX heading / setext underline /
+    // thematic break — is illustrative, NOT a real cross-reference. Without
+    // this gate, the wiki walker pinned `[[fictitious-skill]]` from inside
+    // an indented sample as a live edge, suppressing the genuine `dead`
+    // diagnostic and polluting the dependency graph with phantom edges.
+    // Same noise class as the cycle-Z post-heading-indented-code fix in the
+    // rule extractor — every parse-surface walker must agree on which lines
+    // are code and which are prose.
+    let mut prev_blank = true;
+    let mut prev_line: Option<&str> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
         // Mirror the tab-rejection from `extract_refs_and_rules` so the wiki
@@ -739,11 +752,15 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
                         fence_marker = None;
                     }
                 }
+                prev_blank = false;
+                prev_line = Some(line);
                 continue;
             }
             if is_valid_opener {
                 in_fence = true;
                 fence_marker = Some(run);
+                prev_blank = false;
+                prev_line = Some(line);
                 continue;
             }
             // Invalid backtick-info-string opener: fall through and treat the
@@ -751,9 +768,24 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
             // same line is captured.
         }
         if in_fence {
+            prev_blank = trimmed.is_empty();
+            prev_line = Some(line);
             continue;
         }
-        scan_wiki_links_in_line(line, refs);
+        // Indented code block: 4+ leading spaces (or a leading tab) preceded
+        // by a blank line OR a block-terminator (ATX heading, setext
+        // underline, thematic break). Mirrors the rule extractor's eval-U /
+        // eval-Z logic so the two walkers stay in lockstep.
+        let prev_was_terminator = prev_blank
+            || prev_line
+                .map(|p| is_atx_heading(p) || is_thematic_break(p) || is_setext_underline(p))
+                .unwrap_or(false);
+        let is_indented_code = prev_was_terminator && is_indented_code_line(line);
+        if !is_indented_code {
+            scan_wiki_links_in_line(line, refs);
+        }
+        prev_blank = trimmed.is_empty();
+        prev_line = Some(line);
     }
 }
 
@@ -1654,6 +1686,63 @@ mod tests {
         assert!(
             !mentions.contains(&"fake-inside"),
             "wiki-link inside tilde fence (with backticks in info string) must remain suppressed; {mentions:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_link_inside_indented_code_block_is_suppressed() {
+        // Eval-BB lockstep regression. The rule extractor learned to skip
+        // CommonMark §4.4 indented code blocks (4+ space indent preceded by
+        // blank line OR ATX heading / setext underline / thematic break) in
+        // cycles U and Z. The wiki walker did NOT receive the same gate, so
+        // a `[[wiki-link]]` inside an illustrative indented sample was still
+        // pinned as a real cross-reference — suppressing the genuine `dead`
+        // diagnostic on the (non-existent) target and polluting the
+        // dependency graph with phantom edges.
+        for body in [
+            // Blank line + 4-space indent
+            "Sample:\n\n    See [[fictitious-blank]] for example.\n",
+            // ATX heading + indented code (no blank-line separator needed)
+            "# Heading\n    See [[fictitious-heading]] for example.\n",
+            // Setext underline (h2) + indented code
+            "Title\n---\n    See [[fictitious-setext]] for example.\n",
+            // Thematic break + indented code
+            "para text\n\n***\n    See [[fictitious-thematic]] for example.\n",
+            // Tab-prefixed indented code
+            "Sample:\n\n\tSee [[fictitious-tab]] for example.\n",
+        ] {
+            let (refs, _) = extract_refs_and_rules(body);
+            let mentions: Vec<&str> = refs
+                .iter()
+                .filter_map(|r| match r {
+                    SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                mentions.iter().all(|m| !m.starts_with("fictitious-")),
+                "wiki-link inside indented code block must not be extracted (body={body:?}); got {mentions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wiki_link_indented_paragraph_continuation_still_extracts() {
+        // Mirror sanity check: an indented line that is a paragraph
+        // continuation (no blank line / heading above) is NOT a code block —
+        // the wiki walker must still extract its `[[...]]` mention.
+        let body = "First line of a paragraph.\n    See [[real-skill]] for details.\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        let mentions: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            mentions.contains(&"real-skill"),
+            "indented paragraph continuation (no blank above) must still extract; got {mentions:?}"
         );
     }
 
