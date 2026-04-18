@@ -297,9 +297,32 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         // Recognise both ```...``` and ~~~...~~~ fences. A fence opens with 3+
         // backticks or tildes; it closes with a matching run of the same
         // character (length ≥ opening).
-        let fence_kind = if trimmed.starts_with("```") {
+        //
+        // Per CommonMark §4.5 a fence opener (and closer) may be indented by
+        // 0–3 spaces only. A line with 4+ leading spaces and `\`\`\`` is NOT a
+        // fence — it's an indented code block whose content happens to start
+        // with backticks. Without enforcing this, two related defects fire:
+        //
+        //   1. False-NEGATIVE: an indented `\`\`\`` opens a phantom fence and
+        //      every real `MUST use foo` line that follows is silently dropped
+        //      from rule extraction (until a matching `\`\`\`` happens to close
+        //      it, which may be EOF — the rest of the body becomes invisible).
+        //   2. False-POSITIVE: an indented `\`\`\`` *inside* a real fenced
+        //      block looks like a closing fence, prematurely terminating the
+        //      block and exposing sample text below as if it were a real rule.
+        //
+        // Both surface as the same class of conflict-noise / missed-rule bugs
+        // the cycle-A and cycle-U fence/indented-code skips were already
+        // designed to prevent.
+        //
+        // We count *leading spaces only* (not arbitrary whitespace): a leading
+        // tab in column 0 already counts as indented code per CommonMark
+        // (where a tab expands to the next 4-col stop), so a line beginning
+        // `\t\`\`\`` is never a fence opener regardless.
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        let fence_kind = if leading_spaces <= 3 && trimmed.starts_with("```") {
             Some('`')
-        } else if trimmed.starts_with("~~~") {
+        } else if leading_spaces <= 3 && trimmed.starts_with("~~~") {
             Some('~')
         } else {
             None
@@ -991,6 +1014,69 @@ mod tests {
         assert!(
             !rules.is_empty(),
             "indented continuation (no blank above) is paragraph text — rule must still fire"
+        );
+    }
+
+    #[test]
+    fn indented_backticks_are_not_a_fence_opener() {
+        // CommonMark §4.5: a code fence opener may be indented 0–3 spaces
+        // only. A line with 4+ leading spaces and ```` is part of an indented
+        // code block, NOT a fence — so it must not flip the rule extractor
+        // into "we're inside a fence; drop everything that follows" mode.
+        // Without the leading-space guard, the `MUST use ...` line below was
+        // silently swallowed because the parser thought a fence was open.
+        let body = "Sample:\n\n    ```rust\n    let x = 1;\n\nMUST use `git`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.iter().any(|r| r.subject == "git"),
+            "rule after indented (fake) fence must still be extracted; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn indented_backticks_inside_fence_dont_close_it() {
+        // The mirror failure: an indented ```` *inside* a real fence used to
+        // be treated as a closing fence (since the leading-space check was
+        // missing on the close path too). That prematurely terminated the
+        // block and exposed sample MUST/MUST-NOT prose below as fake rules.
+        let body = "Real code:\n\n```text\n        ```\nMUST use `git`\n```\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.is_empty(),
+            "rule inside a real fence (premature close was the bug) must not fire; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn standard_zero_indent_fence_still_works() {
+        // Regression sanity: ordinary `\`\`\`` at column 0 must still be
+        // recognised. The leading-space guard only rejects 4+ spaces.
+        let body = "Code:\n\n```\nMUST use `git`\n```\n\nMUST use `bar`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        let subjects: Vec<_> = rules.iter().map(|r| r.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"bar"),
+            "rule outside real fence must still extract; got {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"git"),
+            "rule inside real fence must be suppressed; got {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn three_space_indented_fence_is_still_a_fence() {
+        // CommonMark allows up to 3 leading spaces before a fence opener.
+        let body = "Code:\n\n   ```\nMUST use `git`\n   ```\n\nMUST use `bar`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        let subjects: Vec<_> = rules.iter().map(|r| r.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"bar"),
+            "rule after 3-space-indented fence must extract; got {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"git"),
+            "3-space-indented fence is still a fence — inner rule suppressed; got {subjects:?}"
         );
     }
 

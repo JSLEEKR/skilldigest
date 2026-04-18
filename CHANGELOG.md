@@ -51,7 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appears inside a fenced code block (` ``` ` or `~~~`) **or** a CommonMark
   indented code block (a line preceded by a blank line and indented by 4+
   spaces or a tab) so sample / documentation snippets do not produce
-  false-positive conflict issues.
+  false-positive conflict issues. The fence-opener and fence-closer match
+  per CommonMark §4.5: an opener / closer may carry 0–3 leading spaces;
+  4+ spaces in front of ` ``` ` or `~~~` makes the line content of an
+  indented code block, never a fence — so a 4-space-indented ` ``` ` will
+  neither open a phantom fence (silently swallowing every following rule)
+  nor prematurely close a real one (exposing sample text below as fake
+  rules).
 - Per-file metadata / read failures now emit a warning-level issue and
   continue rather than aborting the entire scan with operational exit
   code 2, reserving exit 2 for genuine CLI-level errors (bad scan root,

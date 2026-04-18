@@ -2201,6 +2201,100 @@ fn eval_u_indented_code_block_does_not_swallow_following_paragraph_rule() {
 }
 
 #[test]
+fn eval_v_indented_backticks_do_not_open_phantom_fence() {
+    // Cycle-V false-NEGATIVE: a 4-space-indented `\`\`\`` is NOT a CommonMark
+    // fence opener (per §4.5, the opener may have at most 3 leading spaces).
+    // The line-based rule extractor used to treat it as a fence anyway,
+    // flipping into "in fence" mode and silently dropping every real
+    // `MUST use foo` rule that followed — until a matching `\`\`\`` happened
+    // to close the phantom fence (often EOF, which made the rest of the body
+    // invisible to conflict detection).
+    //
+    // Skill `a` writes a sample indented-code block whose first line is
+    // `\`\`\`rust`, then leaves the block and asserts a rule that conflicts
+    // with skill `b`. The conflict MUST surface.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    std::fs::write(
+        &a,
+        "---\nname: a\n---\n\nSample:\n\n    ```rust\n    let x = 1;\n\nMUST use `git`.\n",
+    )
+    .expect("write a");
+    std::fs::write(&b, "---\nname: b\n---\n\nMUST NOT use `git` ever.\n").expect("write b");
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        !conflicts.is_empty(),
+        "rule after an indented (fake) `\\`\\`\\`` line must still extract; got {stdout}",
+    );
+}
+
+#[test]
+fn eval_v_indented_backticks_do_not_close_real_fence() {
+    // Cycle-V false-POSITIVE mirror of the above: an indented `\`\`\``
+    // *inside* a real fenced block must not be treated as a closing fence.
+    // Without the leading-space guard the phantom close prematurely terminated
+    // the block, exposing sample MUST/MUST-NOT prose below as if it were a
+    // real rule and emitting a conflict that should not exist.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    // Note: the indented `\`\`\`` lives on a line with 8 leading spaces, well
+    // above the 3-space CommonMark threshold, so it must remain content of
+    // the surrounding fence rather than closing it.
+    std::fs::write(
+        &a,
+        "---\nname: a\n---\n\nReal sample:\n\n```text\n        ```\nMUST use `git`.\n```\n",
+    )
+    .expect("write a");
+    std::fs::write(&b, "---\nname: b\n---\n\nMUST NOT use `git` ever.\n").expect("write b");
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        conflicts.is_empty(),
+        "indented `\\`\\`\\`` inside a real fence must not close it (no conflict expected): \
+         {conflicts:?}\nstdout={stdout}",
+    );
+}
+
+#[test]
 fn eval_u_changelog_precedence_matches_readme() {
     // Doc-vs-doc parity: README and CHANGELOG must agree about which budget
     // source wins. README was corrected by eval-Q to read
