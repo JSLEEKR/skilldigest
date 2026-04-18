@@ -1999,3 +1999,92 @@ fn loadout_cli_honors_frontmatter_description() {
          CLI selected: {selected:?}; full output: {stdout}",
     );
 }
+
+#[test]
+fn eval_t_prose_modal_rules_do_not_collide_on_first_word() {
+    // Eval cycle T regression: the rule extractor used to fall back to
+    // "first word of the leftover" when neither a Tool(args) signature nor a
+    // backtick-quoted segment was present. That gave any pair of prose
+    // sentences sharing the same opening word (e.g. `MUST use the system
+    // properly` vs `MUST NOT use the disk slowly`) the same subject "use",
+    // and the conflict detector then reported them as contradicting rules.
+    // No real skill library wants that: the two rules are about completely
+    // different topics. The fix is to refuse to emit a Rule at all when
+    // there is no structural subject.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    std::fs::write(
+        &a,
+        "---\nname: a\n---\n# A\n\nMUST use the system properly.\n",
+    )
+    .expect("write a");
+    std::fs::write(
+        &b,
+        "---\nname: b\n---\n# B\n\nMUST NOT use the disk slowly.\n",
+    )
+    .expect("write b");
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        conflicts.is_empty(),
+        "prose-only modal sentences with no structural subject must not produce a `conflict` \
+         issue (their alleged shared subject was just the word \"use\"): {conflicts:?}",
+    );
+}
+
+#[test]
+fn eval_t_structural_conflicts_still_detected_after_prose_fallback_removal() {
+    // Guard against the prose-fallback fix accidentally killing legitimate
+    // structural conflict detection. Two skills that name the same
+    // backtick-quoted subject with opposing modals must still collide.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a/SKILL.md");
+    let b = dir.path().join("b/SKILL.md");
+    std::fs::create_dir_all(a.parent().expect("parent")).expect("mkdir a");
+    std::fs::create_dir_all(b.parent().expect("parent")).expect("mkdir b");
+    std::fs::write(&a, "---\nname: a\n---\n# A\n\nMUST use `git rebase`.\n").expect("write a");
+    std::fs::write(&b, "---\nname: b\n---\n# B\n\nMUST NOT use `git rebase`.\n").expect("write b");
+
+    let output = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().expect("path"),
+            "--format",
+            "json",
+            "--no-color",
+        ])
+        .output()
+        .expect("run skilldigest");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let conflicts: Vec<_> = v["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter(|i| i["kind"].as_str() == Some("conflict"))
+        .collect();
+    assert!(
+        !conflicts.is_empty(),
+        "backtick-quoted shared subject must still produce a `conflict` issue: {stdout}",
+    );
+}

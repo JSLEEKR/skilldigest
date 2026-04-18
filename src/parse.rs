@@ -630,11 +630,22 @@ fn extract_subject(text: &str) -> Option<String> {
             }
         }
     }
-    // Otherwise the first "word"
-    text.split_whitespace()
-        .next()
-        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-        .filter(|s| !s.is_empty())
+    // No structural subject. The previous fallback returned the first
+    // whitespace-delimited "word" of the leftover, but that produced rampant
+    // false-positive `conflict` issues in any skill library that contained
+    // ordinary prose modal sentences. For example,
+    //
+    //   Skill A: "MUST use the system properly."
+    //   Skill B: "MUST NOT use the disk slowly."
+    //
+    // both yielded subject = "use", which the conflict detector then flagged
+    // as contradicting one another even though the rules are about completely
+    // different topics. Authors who want a rule pinned to a specific subject
+    // can quote it (`MUST use \`git\``) or write it as a tool call (`MUST use
+    // Bash(git)`); without one of those signals there is no reliable way to
+    // identify what the rule is "about" and we'd rather miss the rule
+    // entirely than emit a noisy false positive that blocks a green CI build.
+    None
 }
 
 fn extract_inline_tags(body: &str, tags: &mut Vec<String>) {
@@ -898,9 +909,23 @@ mod tests {
     }
 
     #[test]
-    fn subject_fallback_first_word() {
-        let s = extract_subject("foo bar baz").unwrap();
-        assert_eq!(s, "foo");
+    fn subject_no_structural_signal_returns_none() {
+        // Without a Tool(args) signature or a backtick-quoted segment we
+        // refuse to invent a subject from prose. See `extract_subject` for
+        // why the previous "first word" fallback was a footgun.
+        assert!(extract_subject("foo bar baz").is_none());
+        assert!(extract_subject("the system properly").is_none());
+    }
+
+    #[test]
+    fn extract_rule_prose_only_yields_no_rule() {
+        // "MUST use the system properly" looks rule-shaped but has no
+        // structural subject — emitting a Rule with subject "use" causes
+        // false-positive conflicts against any other prose rule that
+        // happens to start with the same word. The rule extractor should
+        // simply skip it.
+        assert!(extract_rule_from_line("MUST use the system properly", 1).is_none());
+        assert!(extract_rule_from_line("MUST NOT use the disk slowly", 1).is_none());
     }
 
     #[test]
