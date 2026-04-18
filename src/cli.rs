@@ -268,15 +268,24 @@ fn tokens_cmd(
         .config
         .clone()
         .or_else(|| file.parent().and_then(config::find_default));
+    // Load any auto-discovered (or explicit) config file using the same
+    // error-propagating path as `scan` / `loadout` / `graph`. The previous
+    // `.ok().flatten()` chain silently swallowed TOML parse errors, so a
+    // malformed `.skilldigest.toml` next to the target file made the
+    // `tokens` subcommand quietly fall back to the default tokenizer
+    // instead of refusing to run. That hides exactly the same class of
+    // silent-fallback footgun the eval-D `deny_unknown_fields` and eval-K
+    // explicit-config-missing fixes already closed for the other
+    // subcommands. The `tokens` subcommand now bubbles up `Error::Config`
+    // (exit 2) on malformed TOML, matching scan/loadout/graph behaviour.
+    let doc: Option<crate::config::ConfigDoc> = match config_parent.as_deref() {
+        Some(p) => config::load(p)?,
+        None => None,
+    };
     let tokenizer_name: String = cli
         .tokenizer
         .clone()
-        .or_else(|| {
-            config_parent
-                .as_deref()
-                .and_then(|p| config::load(p).ok().flatten())
-                .and_then(|d| d.tokenizer.default)
-        })
+        .or_else(|| doc.as_ref().and_then(|d| d.tokenizer.default.clone()))
         .unwrap_or_else(|| DEFAULT_TOKENIZER.to_string());
     let tokenizer: Arc<dyn Tokenizer> = tokenize::by_name(&tokenizer_name)?;
     if cli.verbose {

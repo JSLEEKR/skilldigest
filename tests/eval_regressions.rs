@@ -1901,3 +1901,101 @@ fn readme_offline_flag_described_as_noop() {
         "README must not regress to the misleading 'Force fully offline (no cache reads/writes)' wording; got: {row}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests added by the independent evaluator (Agent S, round 85).
+//
+// - `loadout_cli_honors_frontmatter_description`: Bug S1 (LOW). The
+//   `loadout::score` function awards `+2` when a skill's
+//   `frontmatter.description` contains the tag, but `audit::run_with_loadout`
+//   built `mini_skills` from the public `SkillSummary` (which carries no
+//   `Frontmatter`) and substituted `Frontmatter::default()`. The description
+//   field was therefore always empty when the loadout pipeline ran end-to-end
+//   from the CLI — so a skill whose ONLY tag-match signal lived in the
+//   description was silently filtered out (`score == 0`) and never selected.
+//   Unit tests against `loadout::recommend` directly passed because they
+//   constructed real `Skill` objects with populated frontmatter; the audit
+//   pipeline regression went unnoticed for 18 cycles. Fix: keep the original
+//   `Vec<Skill>` around in `audit::run_inner` and pass it to the loadout
+//   recommender so every documented scoring branch is honored from the CLI.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tokens_subcommand_rejects_malformed_auto_discovered_config() {
+    // Bug S2 (LOW). The `scan` / `loadout` / `graph` subcommands fail with
+    // exit 2 + a diagnostic when `.skilldigest.toml` is present but cannot
+    // be parsed. The `tokens` subcommand silently fell back to the default
+    // tokenizer because its config-loading path used `.ok().flatten()` to
+    // squash any TOML parse error. Authors who shipped a typo-laden
+    // `.skilldigest.toml` would think their `[tokenizer] default = "o200k"`
+    // was in effect when in fact the whole file was being ignored — the
+    // exact same silent-fallback class of bug eval-D (`deny_unknown_fields`)
+    // and eval-K (`--config <missing>`) already closed for the other
+    // subcommands. Lock the consistent behaviour: `tokens` must also exit 2
+    // on malformed auto-discovered config and name the offending file in
+    // stderr.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".skilldigest.toml"),
+        b"this is = not = toml [\n",
+    )
+    .unwrap();
+    let target = dir.path().join("x.md");
+    std::fs::write(&target, b"body\n").unwrap();
+    let output = Command::new(bin())
+        .args(["tokens", target.to_str().unwrap()])
+        .output()
+        .expect("run tokens");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "tokens subcommand must reject malformed auto-discovered config with exit 2; \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config error") || stderr.contains("TOML parse"),
+        "stderr should describe the config parse failure; got: {stderr}",
+    );
+}
+
+#[test]
+fn loadout_cli_honors_frontmatter_description() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("desconly")).unwrap();
+    // Tag, name, and id all deliberately do NOT contain "git". The only
+    // signal that ties this skill to the `git` tag is the frontmatter
+    // description. If `audit::run_with_loadout` honors the description (the
+    // contract `loadout::score` documents), this skill must be selected.
+    std::fs::write(
+        dir.path().join("desconly/SKILL.md"),
+        b"---\nname: completely-unrelated-name\ndescription: helpful for git workflows\n---\nbody body body\n",
+    )
+    .unwrap();
+    // Anchor the skill so dead-skill detection does not interfere.
+    std::fs::write(dir.path().join("README.md"), b"See @desconly\n").unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "loadout",
+            dir.path().to_str().unwrap(),
+            "--tag",
+            "git",
+            "--max-tokens",
+            "1000",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run loadout");
+    let stdout = std::str::from_utf8(&output.stdout).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(stdout).expect("valid json");
+    let selected = v["loadout"]["skills"].as_array().expect("loadout.skills");
+    assert!(
+        selected.iter().any(|s| s.as_str() == Some("desconly")),
+        "loadout must select the description-only match `desconly` for tag `git`; \
+         CLI selected: {selected:?}; full output: {stdout}",
+    );
+}

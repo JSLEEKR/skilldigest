@@ -62,6 +62,21 @@ impl AuditOptions {
 
 /// Run a full audit.
 pub fn run(options: AuditOptions) -> Result<Report> {
+    let (report, _skills) = run_inner(options)?;
+    Ok(report)
+}
+
+/// Internal helper that runs the full audit pipeline and returns both the
+/// public-facing [`Report`] and the underlying [`Vec<Skill>`].
+///
+/// `run_with_loadout` needs the full `Skill` objects (specifically
+/// `frontmatter.description`) to drive the loadout scorer; building a fresh
+/// `Skill` from a `SkillSummary` after the fact loses every `Frontmatter`
+/// field, so the description-based scoring branch in `loadout::score`
+/// silently became dead code in the CLI loadout pipeline. Keeping the
+/// intermediate `skills` vec around closes that gap without changing the
+/// public `run` signature.
+fn run_inner(options: AuditOptions) -> Result<(Report, Vec<Skill>)> {
     let scan_out = scan::scan_dir(&options.root, &options.policy)?;
 
     // Parse in parallel.
@@ -187,30 +202,21 @@ pub fn run(options: AuditOptions) -> Result<Report> {
         loadout: None,
     };
 
-    Ok(report)
+    Ok((report, skills))
 }
 
 /// Audit + append a loadout recommendation for the given tag.
+///
+/// Computes the loadout against the *full* `Skill` objects produced by the
+/// audit pipeline so that every field used by [`crate::loadout::score`] —
+/// including `frontmatter.description` — is honored. Building a stand-in
+/// `Skill` from the public `SkillSummary` (which does not carry the
+/// frontmatter) silently dropped description-based scoring in the CLI
+/// loadout pipeline; running the loadout against the original `skills`
+/// closes that gap.
 pub fn run_with_loadout(options: AuditOptions, tag: &str, max_tokens: usize) -> Result<Report> {
-    let mut report = run(options)?;
-    // rebuild the skills vec from summaries for the loadout engine
-    let mini_skills: Vec<Skill> = report
-        .skills
-        .iter()
-        .map(|s| Skill {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            path: s.path.clone(),
-            frontmatter: Default::default(),
-            tokens: s.tokens,
-            refs: vec![],
-            rules: vec![],
-            tags: s.tags.clone(),
-            warnings: vec![],
-            body_bytes: 0,
-        })
-        .collect();
-    let loadout = crate::loadout::recommend(&mini_skills, tag, max_tokens);
+    let (mut report, skills) = run_inner(options)?;
+    let loadout = crate::loadout::recommend(&skills, tag, max_tokens);
     report.loadout = Some(loadout);
     Ok(report)
 }
