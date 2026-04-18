@@ -329,10 +329,29 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         };
         if let Some(ch) = fence_kind {
             let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
+            // Per CommonMark §4.5 a *closing* fence must contain nothing after
+            // the run other than optional trailing whitespace — info strings
+            // are forbidden on the closer. Without that check, a nested
+            // documentation snippet like
+            //
+            //   ```text
+            //   ```rust          ← intended as INSIDE the text block
+            //   MUST use `phantom`
+            //   ```
+            //
+            // prematurely terminates the outer fence at the inner ```rust
+            // line, exposing the `MUST use ...` line below as if it were a
+            // real rule. The same noise class as the eval-V open-side fix:
+            // every fence/non-fence misclassification surfaces as a phantom
+            // rule that the conflict detector then collides with real rules
+            // elsewhere in the library.
+            let after_run: &str = trimmed[run.len()..].trim_end();
+            let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
             if in_fence {
-                // Only close if the marker matches (same char, ≥ opening len).
+                // Only close if the marker matches (same char, ≥ opening len)
+                // AND the line carries no info string after the run.
                 if let Some(open) = &fence_marker {
-                    if run.chars().all(|c| c == ch) && run.len() >= open.len() {
+                    if is_valid_closer && run.len() >= open.len() {
                         in_fence = false;
                         fence_marker = None;
                     }
@@ -1061,6 +1080,39 @@ mod tests {
         assert!(
             !subjects.contains(&"git"),
             "rule inside real fence must be suppressed; got {subjects:?}"
+        );
+    }
+
+    #[test]
+    fn closing_fence_with_info_string_is_not_a_closer() {
+        // CommonMark §4.5: a closing fence must NOT carry an info string;
+        // anything after the run other than trailing whitespace disqualifies
+        // it from being a closer. Without enforcing this, a nested
+        // documentation example like the one below caused the outer ```text
+        // fence to terminate early at the inner ```rust line, after which the
+        // `MUST use phantom` line was harvested as a real rule and collided
+        // with any matching `MUST NOT use phantom` elsewhere in the library.
+        let body = "Sample:\n\n```text\n```rust\nMUST use `phantom`\n```\nEnd.\n```\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.is_empty(),
+            "closing fence with info string must not terminate the outer block; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn closing_fence_with_trailing_whitespace_still_closes() {
+        // Trailing whitespace on a closer is explicitly allowed.
+        let body = "Code:\n\n```\nMUST use `git`\n```   \n\nMUST use `bar`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        let subjects: Vec<_> = rules.iter().map(|r| r.subject.as_str()).collect();
+        assert!(
+            subjects.contains(&"bar"),
+            "closer with trailing whitespace must still close the fence; got {subjects:?}"
+        );
+        assert!(
+            !subjects.contains(&"git"),
+            "rule inside the fence must remain suppressed; got {subjects:?}"
         );
     }
 
