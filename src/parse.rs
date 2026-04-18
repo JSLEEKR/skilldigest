@@ -753,14 +753,37 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
                     }
                 }
                 prev_blank = false;
-                prev_line = Some(line);
+                // Do NOT update prev_line here. The rule extractor
+                // (extract_refs_and_rules) deliberately keeps prev_line at
+                // whatever non-fence content line came before the fence —
+                // so that an ATX heading / setext underline / thematic
+                // break that immediately preceded the fence still counts as
+                // the block-terminator for any indented chunk that follows
+                // a fence-close. Updating prev_line to the literal `\`\`\``
+                // line would silently break that lockstep: a body like
+                //
+                //     # Heading
+                //     ```
+                //     ```
+                //         [[fictitious]]
+                //
+                // would have its trailing indented `[[wiki]]` correctly
+                // suppressed by the rule extractor (prev_line == `# Heading`
+                // → block-terminator → indented-code) but extracted by the
+                // wiki walker (prev_line == ```` `` → not a terminator →
+                // paragraph continuation). Same false-positive class as
+                // every previous lockstep regression (eval-V through
+                // eval-BB): code samples are illustrative, not assertive.
                 continue;
             }
             if is_valid_opener {
                 in_fence = true;
                 fence_marker = Some(run);
                 prev_blank = false;
-                prev_line = Some(line);
+                // See the long comment on the close-side branch above —
+                // prev_line must stay at the previous non-fence content
+                // line so the post-fence indented-code detector keeps
+                // working in lockstep with the rule extractor.
                 continue;
             }
             // Invalid backtick-info-string opener: fall through and treat the
@@ -1767,5 +1790,99 @@ mod tests {
             !mentions.contains(&"fake"),
             "sample mention leaked from inside fence; {mentions:?}"
         );
+    }
+
+    #[test]
+    fn wiki_walker_keeps_prev_line_through_fence_open_close() {
+        // Eval-CC lockstep regression. The rule extractor deliberately
+        // leaves `prev_line` untouched when a line opens or closes a fence,
+        // so any block-terminator (ATX heading / setext underline /
+        // thematic break) immediately preceding an empty fence pair still
+        // counts as the prior block when an indented chunk follows the
+        // fence-close. The wiki walker previously updated `prev_line` to
+        // the literal `\`\`\`` fence-delimiter line on both branches, which
+        // silently broke that lockstep:
+        //
+        //     # Heading
+        //     ```
+        //     ```
+        //         [[fictitious-after-empty-fence]]
+        //
+        // The rule extractor's prev_line stays at "# Heading" through the
+        // empty fence pair, recognises L4 as a CommonMark §4.4 indented
+        // code block (ATX heading is a block-terminator per §4.4 widening),
+        // and suppresses any rule on it. The wiki walker's prev_line moved
+        // to `\`\`\`` after L2, so by L4 the heading was lost,
+        // `prev_was_terminator` evaluated to false, and the indented sample
+        // `[[fictitious-after-empty-fence]]` was pinned as a real
+        // cross-reference — suppressing the genuine `dead` diagnostic on
+        // the (non-existent) target and polluting the dependency graph.
+        //
+        // Same false-positive class as eval-V through eval-BB: every
+        // walker that reads markdown must agree on which lines are code
+        // and which are prose, and they must agree across every shape of
+        // fence/heading/indent interleaving — not just the ones that
+        // appear in the most recent regression test.
+        //
+        // We only assert the cases where the rule extractor itself is
+        // already correct (block-terminator immediately precedes the empty
+        // fence pair). The non-empty-fence variant is covered by the
+        // lockstep_parity test below — both walkers must agree, even when
+        // both are conservatively permissive.
+        for body in [
+            // ATX heading + empty fence pair + indented wiki
+            "# Heading\n```\n```\n    [[fictitious-after-empty-fence]]\n",
+            // Setext underline (h1) + empty fence pair + indented wiki
+            "Title\n===\n```\n```\n    [[fictitious-after-setext]]\n",
+            // Thematic break + empty fence pair + indented wiki
+            "para\n\n***\n```\n```\n    [[fictitious-after-thematic]]\n",
+            // Tilde-fence variant of the empty-fence-after-heading case
+            "# Heading\n~~~\n~~~\n    [[fictitious-after-tilde]]\n",
+        ] {
+            let (refs, _) = extract_refs_and_rules(body);
+            let mentions: Vec<&str> = refs
+                .iter()
+                .filter_map(|r| match r {
+                    SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                mentions.iter().all(|m| !m.starts_with("fictitious-")),
+                "wiki-link inside indented code block (preceded by block-terminator + empty \
+                 fence pair) must not be extracted (body={body:?}); got {mentions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wiki_walker_lockstep_parity_with_rule_walker_through_fences() {
+        // Lockstep parity: for any body that interleaves headings, fences,
+        // and indented chunks, the wiki walker's `prev_line`/`prev_blank`
+        // state must evolve identically to the rule extractor's. We probe
+        // by constructing bodies that contain BOTH a `MUST` and a
+        // `[[wiki]]` on the same indented line and asserting that whether
+        // the rule fires (`MUST` extracted as a Rule) matches whether the
+        // mention fires (`[[wiki]]` captured as a Mention). Walking out of
+        // lockstep means a real-world skill could trip exactly one walker
+        // and produce a half-broken diagnostic.
+        for body in [
+            "# Heading\n```\n```\n    MUST use `phantom-lockstep` and [[wiki-lockstep]]\n",
+            "# Heading\n```\ninside\n```\n    MUST use `phantom-lockstep-2` and [[wiki-lockstep-2]]\n",
+            "para\n\n***\n```\n```\n    MUST use `phantom-lockstep-3` and [[wiki-lockstep-3]]\n",
+        ] {
+            let (refs, rules) = extract_refs_and_rules(body);
+            let rule_fired = rules.iter().any(|r| r.subject.starts_with("phantom-lockstep"));
+            let mention_fired = refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str().starts_with("wiki-lockstep")
+            ));
+            assert_eq!(
+                rule_fired, mention_fired,
+                "lockstep parity broken (body={body:?}): rule_fired={rule_fired} \
+                 mention_fired={mention_fired}; both walkers must agree on whether the \
+                 indented line is code or prose"
+            );
+        }
     }
 }
