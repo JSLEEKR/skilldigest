@@ -349,10 +349,21 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         // tab in column 0 already counts as indented code per CommonMark
         // (where a tab expands to the next 4-col stop), so a line beginning
         // `\t\`\`\`` is never a fence opener regardless.
+        //
+        // The tab-rejection is enforced by the explicit `starts_with('\t')`
+        // guard below — `trim_start()` happily strips a leading tab too, so
+        // counting spaces alone would silently treat `\t\`\`\`` as a 0-indent
+        // fence and either (a) open a phantom fence that swallows every real
+        // rule until EOF (false-NEGATIVE) or (b) prematurely close a real
+        // outer fence and expose sample `MUST use phantom` text below as a
+        // real rule (false-POSITIVE conflict). Same noise class as eval-V
+        // (≤3-space rule on open/close) but for tabs — see CommonMark §4.5
+        // which equates a leading tab with ≥4 columns of indentation.
+        let starts_with_tab = line.starts_with('\t');
         let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let fence_kind = if leading_spaces <= 3 && trimmed.starts_with("```") {
+        let fence_kind = if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("```") {
             Some('`')
-        } else if leading_spaces <= 3 && trimmed.starts_with("~~~") {
+        } else if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("~~~") {
             Some('~')
         } else {
             None
@@ -634,10 +645,15 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
     let mut fence_marker: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
+        // Mirror the tab-rejection from `extract_refs_and_rules` so the wiki
+        // walker stays in lockstep with the rule extractor on tab-prefixed
+        // fence opens/closes — see CommonMark §4.5 and the long comment over
+        // there for the full rationale.
+        let starts_with_tab = line.starts_with('\t');
         let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let fence_kind = if leading_spaces <= 3 && trimmed.starts_with("```") {
+        let fence_kind = if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("```") {
             Some('`')
-        } else if leading_spaces <= 3 && trimmed.starts_with("~~~") {
+        } else if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("~~~") {
             Some('~')
         } else {
             None
@@ -1386,6 +1402,56 @@ mod tests {
                 SkillRef::Mention { skill_id } if skill_id.as_str() == "real-skill"
             )),
             "real wiki-link outside code context must extract; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn tab_prefixed_backticks_are_not_a_fence_opener() {
+        // CommonMark §4.5: a fence opener may be indented by 0–3 spaces only.
+        // A leading tab counts as ≥4 columns of indentation, so a line
+        // starting `\t\`\`\`` is an indented code block — NOT a fence — and
+        // must not flip the rule extractor into "we're inside a fence; drop
+        // everything that follows" mode. Without the tab guard the
+        // `MUST use git` line below was silently swallowed because the parser
+        // thought a fence was open and the matching tab-prefixed `\`\`\``
+        // closed it (so the rule never fired even outside the fake block).
+        let body = "Sample:\n\n\t```\n\t```\n\nMUST use `git`\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.iter().any(|r| r.subject == "git"),
+            "rule after tab-prefixed (fake) fence pair must still be extracted; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn tab_prefixed_backticks_inside_fence_dont_close_it() {
+        // Mirror failure: a tab-indented `\`\`\`` *inside* a real fence used
+        // to be treated as a closing fence (since the leading-space check
+        // ignored tabs). That prematurely terminated the block and exposed
+        // sample `MUST use phantom` prose below as a fake rule, which then
+        // collided with any matching `MUST NOT use phantom` elsewhere in the
+        // library — a high-noise false-positive `conflict` issue.
+        let body = "Real:\n\n```text\n\t```\nMUST use `phantom`\n```\nDone.\n";
+        let (_refs, rules) = extract_refs_and_rules(body);
+        assert!(
+            rules.is_empty(),
+            "tab-indented \\`\\`\\` inside a real fence must not close it; got {rules:?}"
+        );
+    }
+
+    #[test]
+    fn tab_prefixed_fence_does_not_suppress_inner_wiki_link() {
+        // Same defect class for the wiki walker: a tab-prefixed `\`\`\`` must
+        // not open a fake fence that suppresses real `[[...]]` mentions
+        // appearing on subsequent (un-fenced) lines.
+        let body = "Sample:\n\n\t```\n\t```\n\nSee [[real-skill]] please.\n";
+        let (refs, _rules) = extract_refs_and_rules(body);
+        assert!(
+            refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "real-skill"
+            )),
+            "wiki-link after tab-prefixed (fake) fence pair must still extract; got {refs:?}"
         );
     }
 
