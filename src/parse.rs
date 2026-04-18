@@ -413,10 +413,33 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
                 true
             };
             if in_fence {
-                // Only close if the marker matches (same char, ≥ opening len)
-                // AND the line carries no info string after the run.
+                // Only close if the marker matches (same character, ≥ opening
+                // length) AND the line carries no info string after the run.
+                //
+                // Per CommonMark §4.5: "The content of the code block consists
+                // of all subsequent lines, until a closing code fence of the
+                // same type as the code block began with (backticks or tildes)
+                // ... appears." A `~~~` line CANNOT close a backtick fence,
+                // and a `\`\`\`` line CANNOT close a tilde fence. Without the
+                // same-character guard, an illustrative documentation snippet
+                // like
+                //
+                //   ```
+                //   MUST use `phantom`
+                //   ~~~                 ← intended as INSIDE the backtick block
+                //   [[fictitious]]
+                //   ```
+                //
+                // would have its inner `~~~` line wrongly treated as a closer
+                // (the only constraint was run-length parity), prematurely
+                // terminating the outer backtick fence and exposing the
+                // `[[fictitious]]` line below as if it were a real wiki
+                // mention. Same false-positive class as every previous
+                // fence/non-fence misclassification (eval-V, W, X, Y, Z, AA,
+                // BB, CC).
                 if let Some(open) = &fence_marker {
-                    if is_valid_closer && run.len() >= open.len() {
+                    let open_ch = open.chars().next();
+                    if is_valid_closer && run.len() >= open.len() && open_ch == Some(ch) {
                         in_fence = false;
                         fence_marker = None;
                     }
@@ -746,8 +769,17 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
                 true
             };
             if in_fence {
+                // Same-character guard mirrors the rule extractor (eval-CC):
+                // per CommonMark §4.5, a `~~~` line cannot close a backtick
+                // fence and a `\`\`\`` line cannot close a tilde fence —
+                // the closer must use the same character as the opener.
+                // Without this guard, an illustrative `~~~` line inside a
+                // real backtick fence prematurely terminated the block and
+                // exposed any `[[wiki]]` mention below as a real cross-
+                // reference.
                 if let Some(open) = &fence_marker {
-                    if is_valid_closer && run.len() >= open.len() {
+                    let open_ch = open.chars().next();
+                    if is_valid_closer && run.len() >= open.len() && open_ch == Some(ch) {
                         in_fence = false;
                         fence_marker = None;
                     }
@@ -1853,6 +1885,79 @@ mod tests {
                  fence pair) must not be extracted (body={body:?}); got {mentions:?}"
             );
         }
+    }
+
+    #[test]
+    fn fence_closer_must_match_opener_character_backtick_then_tilde() {
+        // Eval-CC bug class B: per CommonMark §4.5 a fenced code block ends
+        // only when a closer uses the SAME character (backtick or tilde) as
+        // the opener. A `~~~` line is NOT a valid closer for a `\`\`\``
+        // fence, and vice versa. Both walkers previously accepted any
+        // `is_valid_closer` line whose run was ≥ the opener's length,
+        // ignoring the character — so an illustrative `~~~` inside a real
+        // backtick fence prematurely terminated the block:
+        //
+        //   ```
+        //   MUST use `phantom`
+        //   ~~~                    ← intended as INSIDE the backtick block
+        //   [[fictitious]]
+        //   ```
+        //
+        // The phantom `MUST` was correctly suppressed (rule walker is in
+        // fence), but the inner `~~~` flipped in_fence=false, exposing
+        // `[[fictitious]]` as a real wiki mention. Same false-positive
+        // class as every previous fence misclassification.
+        let body = "```\nMUST use `phantom-tilde-close`\n~~~\n[[fictitious-after-tilde]]\n```\nReal: [[real-after-true-close]]\n";
+        let (refs, rules) = extract_refs_and_rules(body);
+        let phantom = rules.iter().any(|r| r.subject.contains("phantom"));
+        let mentions: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !phantom,
+            "phantom rule inside backtick fence must remain suppressed; rules={rules:?}"
+        );
+        assert!(
+            !mentions.contains(&"fictitious-after-tilde"),
+            "`~~~` line must NOT close a backtick fence; \
+             [[fictitious-after-tilde]] leaked from inside fenced block; got {mentions:?}"
+        );
+        assert!(
+            mentions.contains(&"real-after-true-close"),
+            "real wiki mention after the genuine `\\`\\`\\`` close must extract; got {mentions:?}"
+        );
+    }
+
+    #[test]
+    fn fence_closer_must_match_opener_character_tilde_then_backtick() {
+        // Mirror: `\`\`\`` cannot close a `~~~` fence.
+        let body = "~~~\nMUST use `phantom-bt-close`\n```\n[[fictitious-after-bt]]\n~~~\nReal: [[real-after-true-tilde]]\n";
+        let (refs, rules) = extract_refs_and_rules(body);
+        let phantom = rules.iter().any(|r| r.subject.contains("phantom"));
+        let mentions: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !phantom,
+            "phantom rule inside tilde fence must remain suppressed; rules={rules:?}"
+        );
+        assert!(
+            !mentions.contains(&"fictitious-after-bt"),
+            "`\\`\\`\\`` line must NOT close a tilde fence; \
+             [[fictitious-after-bt]] leaked from inside fenced block; got {mentions:?}"
+        );
+        assert!(
+            mentions.contains(&"real-after-true-tilde"),
+            "real wiki mention after the genuine `~~~` close must extract; got {mentions:?}"
+        );
     }
 
     #[test]
