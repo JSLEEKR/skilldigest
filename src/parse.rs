@@ -251,27 +251,50 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_FOOTNOTES);
-    let parser = Parser::new_ext(body, options);
+
+    // Single pass over the pulldown-cmark event stream. We collect:
+    //
+    //   * `link_refs` (Tag::Link)
+    //   * `tool_invocations` and `@mentions` from Text/Code events outside
+    //     any code block
+    //   * `code_block_ranges`: byte ranges of every Tag::CodeBlock
+    //     (fenced + indented). pulldown-cmark already enforces every
+    //     CommonMark §4.4/§4.5 edge case the previous hand-rolled walkers
+    //     re-implemented (≤3-space fence-opener indent, tab-as-indent,
+    //     same-character closer, no info string on closer, no backticks
+    //     in backtick-fence info strings, indented-code-after-heading,
+    //     etc. — see cycle V through CC regressions).
+    //   * `code_span_ranges`: byte ranges of every inline `Code` event so
+    //     the per-line wiki walker can mask `\`[[foo]]\`` examples.
+    //
+    // The two line-based extractors below (rules, wiki-links) then consult
+    // the byte-range index — they no longer hand-roll fence detection. Any
+    // future CommonMark edge case is automatically inherited from
+    // pulldown-cmark instead of having to be patched into two parallel
+    // state machines that drift out of lockstep.
+    let parser = Parser::new_ext(body, options).into_offset_iter();
 
     let mut in_link_dest: Option<String> = None;
-    // Track fenced/indented code-block depth from the pulldown-cmark event
-    // stream so that `@mention` / tool invocations baked into illustrative
-    // code samples don't leak out as real cross-references. Pulldown-cmark
-    // emits `Event::Text` for the code lines inside a CodeBlock; without this
-    // gate, a documentation skill that explains the `@other-skill` syntax in
-    // a fenced sample would pin the (possibly fictitious) `other-skill` as a
-    // live reference, suppressing the genuine `dead` diagnostic on it and
-    // polluting the graph with phantom edges. This is the event-stream half
-    // of the same fix that the raw `scan_wiki_links_raw` walker now also
-    // applies for `[[wiki]]` mentions in code samples.
-    let mut in_code_block: usize = 0;
-    for event in parser {
+    let mut code_block_depth: usize = 0;
+    let mut code_block_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut code_span_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut current_code_block_start: Option<usize> = None;
+
+    for (event, range) in parser {
         match event {
             Event::Start(Tag::CodeBlock(_kind)) => {
-                in_code_block += 1;
+                if code_block_depth == 0 {
+                    current_code_block_start = Some(range.start);
+                }
+                code_block_depth += 1;
             }
             Event::End(TagEnd::CodeBlock) => {
-                in_code_block = in_code_block.saturating_sub(1);
+                code_block_depth = code_block_depth.saturating_sub(1);
+                if code_block_depth == 0 {
+                    if let Some(start) = current_code_block_start.take() {
+                        code_block_ranges.push((start, range.end));
+                    }
+                }
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 in_link_dest = Some(dest_url.to_string());
@@ -281,229 +304,75 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
                     add_link_ref(&mut refs, &dest);
                 }
             }
-            // `Event::Code` is an inline code span; tool-invocation extraction
-            // here is intentional because backtick-quoted `Bash(ls)` tokens are
-            // the documented way authors flag tool calls. Wiki/@mention
-            // extraction is NOT done on inline code spans (handled in the raw
-            // walker below, which now skips backtick-fenced regions itself).
-            // The match guard suppresses extraction inside fenced code blocks.
-            Event::Code(ref c) if in_code_block == 0 => {
-                scan_tool_invocation(c, &mut refs);
+            // `Event::Code` is an inline code span. Tool-invocation extraction
+            // here is intentional because backtick-quoted `Bash(ls)` tokens
+            // are the documented way authors flag tool calls. The match guard
+            // suppresses extraction inside fenced/indented code blocks, where
+            // pulldown-cmark also emits Code/Text events for the literal
+            // contents.
+            Event::Code(ref c) => {
+                code_span_ranges.push((range.start, range.end));
+                if code_block_depth == 0 {
+                    scan_tool_invocation(c, &mut refs);
+                }
             }
-            Event::Text(ref t) if in_code_block == 0 => {
+            Event::Text(ref t) if code_block_depth == 0 => {
                 scan_mentions_and_files(t, &mut refs);
                 scan_tool_invocation(t, &mut refs);
             }
             _ => {}
         }
     }
-    // Wiki-link extraction must also run against the raw body, because
-    // pulldown-cmark splits `[[...]]` across separate Text events (one each
-    // for `[`, `[`, `inner`, `]`, `]`) — so the per-event `scan_mentions_and_files`
-    // call above never observes the full `[[inner]]` string. Running a second
-    // pass on the raw body captures wiki-links without double-counting
-    // @mentions (the raw scan collects both, but dedup below absorbs the
-    // duplicates).
-    //
-    // The raw walker MUST track fenced-code state itself, because the body
-    // string still contains the literal `[[...]]` text inside any
-    // illustrative fenced sample — a documentation skill that shows
-    // `[[other-skill]]` in a markdown code block would otherwise pin
-    // `other-skill` as a real cross-reference. Same false-positive class as
-    // the cycle-A / cycle-U fence-aware rule extractor: code samples are
-    // illustrative, not assertive.
-    scan_wiki_links_raw(body, &mut refs);
 
-    // Rule extraction works line-by-line on the raw body, but must NOT
-    // trigger inside fenced code blocks. Sample/documentation code frequently
-    // contains "MUST NOT use X" style examples that are not themselves rules
-    // the skill is asserting — picking them up produces false-positive
-    // conflict issues that block CI builds without cause.
-    let mut in_fence = false;
-    let mut fence_marker: Option<String> = None;
-    let mut prev_blank = true; // Treat the start of body as if preceded by blank.
-                               // Track the *previous non-fence line* for setext-underline detection: a
-                               // line of `===` or `---` immediately following non-blank paragraph text
-                               // converts that text into a heading. We only need the prior line's
-                               // contents (specifically, "was it non-empty paragraph text?") to detect
-                               // the pattern.
-    let mut prev_line: Option<&str> = None;
+    // Sort code-block ranges by start so the membership test is a simple
+    // linear scan (the input is already roughly sorted; dedupe just in case).
+    code_block_ranges.sort_unstable();
+    code_span_ranges.sort_unstable();
+
+    // Walk lines once. For each line:
+    //   * Compute its byte range in `body`.
+    //   * If the line falls inside a code-block range, skip both rule and
+    //     wiki-link extraction — pulldown-cmark has already classified the
+    //     line as code (fenced or indented). Sample / how-to documentation
+    //     frequently contains "MUST NOT use X" or "[[other-skill]]" examples
+    //     inside code blocks; treating them as real rules / mentions
+    //     produces the false-positive `conflict` and phantom-edge bugs the
+    //     cycle V–CC fixes were designed to prevent.
+    //   * Otherwise, try `extract_rule_from_line` and run the wiki-link
+    //     scanner with inline-code-span byte ranges masked out.
+    let mut byte_offset = 0usize;
     for (i, line) in body.lines().enumerate() {
-        let trimmed = line.trim_start();
-        // Recognise both ```...``` and ~~~...~~~ fences. A fence opens with 3+
-        // backticks or tildes; it closes with a matching run of the same
-        // character (length ≥ opening).
-        //
-        // Per CommonMark §4.5 a fence opener (and closer) may be indented by
-        // 0–3 spaces only. A line with 4+ leading spaces and `\`\`\`` is NOT a
-        // fence — it's an indented code block whose content happens to start
-        // with backticks. Without enforcing this, two related defects fire:
-        //
-        //   1. False-NEGATIVE: an indented `\`\`\`` opens a phantom fence and
-        //      every real `MUST use foo` line that follows is silently dropped
-        //      from rule extraction (until a matching `\`\`\`` happens to close
-        //      it, which may be EOF — the rest of the body becomes invisible).
-        //   2. False-POSITIVE: an indented `\`\`\`` *inside* a real fenced
-        //      block looks like a closing fence, prematurely terminating the
-        //      block and exposing sample text below as if it were a real rule.
-        //
-        // Both surface as the same class of conflict-noise / missed-rule bugs
-        // the cycle-A and cycle-U fence/indented-code skips were already
-        // designed to prevent.
-        //
-        // We count *leading spaces only* (not arbitrary whitespace): a leading
-        // tab in column 0 already counts as indented code per CommonMark
-        // (where a tab expands to the next 4-col stop), so a line beginning
-        // `\t\`\`\`` is never a fence opener regardless.
-        //
-        // The tab-rejection is enforced by the explicit `starts_with('\t')`
-        // guard below — `trim_start()` happily strips a leading tab too, so
-        // counting spaces alone would silently treat `\t\`\`\`` as a 0-indent
-        // fence and either (a) open a phantom fence that swallows every real
-        // rule until EOF (false-NEGATIVE) or (b) prematurely close a real
-        // outer fence and expose sample `MUST use phantom` text below as a
-        // real rule (false-POSITIVE conflict). Same noise class as eval-V
-        // (≤3-space rule on open/close) but for tabs — see CommonMark §4.5
-        // which equates a leading tab with ≥4 columns of indentation.
-        let starts_with_tab = line.starts_with('\t');
-        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let fence_kind = if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("```") {
-            Some('`')
-        } else if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("~~~") {
-            Some('~')
-        } else {
-            None
-        };
-        if let Some(ch) = fence_kind {
-            let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
-            // Per CommonMark §4.5 a *closing* fence must contain nothing after
-            // the run other than optional trailing whitespace — info strings
-            // are forbidden on the closer. Without that check, a nested
-            // documentation snippet like
-            //
-            //   ```text
-            //   ```rust          ← intended as INSIDE the text block
-            //   MUST use `phantom`
-            //   ```
-            //
-            // prematurely terminates the outer fence at the inner ```rust
-            // line, exposing the `MUST use ...` line below as if it were a
-            // real rule. The same noise class as the eval-V open-side fix:
-            // every fence/non-fence misclassification surfaces as a phantom
-            // rule that the conflict detector then collides with real rules
-            // elsewhere in the library.
-            let after_run: &str = trimmed[run.len()..].trim_end();
-            let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
-            // Per CommonMark §4.5: "If the info string comes after a backtick
-            // fence, it may not contain any backtick characters." So a line
-            // like ```rust`bad`info is NOT a fence opener — it's a paragraph
-            // start (the inline-parse rule otherwise misinterprets the closing
-            // backtick of an inline-code span as a fence opener). Without this
-            // guard the parser opened a phantom fence and silently swallowed
-            // every real `MUST use foo` line that followed until a matching
-            // backtick run happened to close the fake block (or until EOF).
-            // pulldown-cmark agrees the line is paragraph text, so this fix
-            // realigns our line-based extractor with the canonical event
-            // stream. Tilde fences are NOT subject to the same restriction
-            // (info strings on tilde fences may legally contain backticks),
-            // so the guard is gated on `ch == '`'`.
-            let is_valid_opener = if ch == '`' {
-                !after_run.contains('`')
-            } else {
-                true
-            };
-            if in_fence {
-                // Only close if the marker matches (same character, ≥ opening
-                // length) AND the line carries no info string after the run.
-                //
-                // Per CommonMark §4.5: "The content of the code block consists
-                // of all subsequent lines, until a closing code fence of the
-                // same type as the code block began with (backticks or tildes)
-                // ... appears." A `~~~` line CANNOT close a backtick fence,
-                // and a `\`\`\`` line CANNOT close a tilde fence. Without the
-                // same-character guard, an illustrative documentation snippet
-                // like
-                //
-                //   ```
-                //   MUST use `phantom`
-                //   ~~~                 ← intended as INSIDE the backtick block
-                //   [[fictitious]]
-                //   ```
-                //
-                // would have its inner `~~~` line wrongly treated as a closer
-                // (the only constraint was run-length parity), prematurely
-                // terminating the outer backtick fence and exposing the
-                // `[[fictitious]]` line below as if it were a real wiki
-                // mention. Same false-positive class as every previous
-                // fence/non-fence misclassification (eval-V, W, X, Y, Z, AA,
-                // BB, CC).
-                if let Some(open) = &fence_marker {
-                    let open_ch = open.chars().next();
-                    if is_valid_closer && run.len() >= open.len() && open_ch == Some(ch) {
-                        in_fence = false;
-                        fence_marker = None;
-                    }
-                }
-                prev_blank = false;
-                continue;
-            }
-            if is_valid_opener {
-                in_fence = true;
-                fence_marker = Some(run);
-                prev_blank = false;
-                continue;
-            }
-            // Backtick fence with backticks in the info string — fall through
-            // and treat the line as ordinary paragraph text (rule extraction
-            // applies). prev_blank stays false.
-            prev_blank = false;
-        }
-        if in_fence {
-            prev_blank = trimmed.is_empty();
-            prev_line = Some(line);
+        let line_start = byte_offset;
+        let line_end = line_start + line.len();
+        // Account for the `\n` consumed by `lines()`. The last line may have
+        // no trailing newline; we never need exact match on the final byte
+        // so the off-by-one is harmless.
+        byte_offset = line_end + 1;
+
+        if byte_in_any_range(line_start, &code_block_ranges)
+            || byte_in_any_range(line_end.saturating_sub(1), &code_block_ranges)
+        {
             continue;
         }
-        // CommonMark indented code block: a line with 4+ leading spaces (or a
-        // tab) preceded by a blank line is treated as code, not paragraph
-        // text. Sample / how-to documentation frequently shows MUST/MUST NOT
-        // examples this way (the syntax predates fenced blocks). Picking
-        // those up produces the same class of false-positive `conflict`
-        // issue that the fenced-block skip already prevents — see eval-A for
-        // the fenced equivalent. Detecting this requires tracking the
-        // previous line's blankness, since a continuation line of an ongoing
-        // paragraph that happens to be deeply indented is NOT a code block.
-        //
-        // Per CommonMark §4.4 "An indented code block cannot interrupt a
-        // paragraph, so there must be a blank line between a paragraph and a
-        // following indented code block." But a HEADING is not a paragraph —
-        // it terminates the prior block on its own — so an indented chunk
-        // immediately following an ATX heading (`# foo`), a setext heading
-        // underline (`====` / `----`), or a thematic break (`---` / `***`)
-        // IS an indented code block even without a blank-line separator.
-        // Without this widening, a sample like
-        //
-        //     # Heading
-        //         MUST use `phantom`
-        //
-        // wrongly extracted `phantom` as a real rule (see Y2 / Y2b probe).
-        let prev_was_terminator = prev_blank
-            || prev_line
-                .map(|p| is_atx_heading(p) || is_thematic_break(p) || is_setext_underline(p))
-                .unwrap_or(false);
-        let is_indented_code = prev_was_terminator && is_indented_code_line(line);
-        if !is_indented_code {
-            if let Some(rule) = extract_rule_from_line(line, i + 1) {
-                rules.push(rule);
-            }
+
+        if let Some(rule) = extract_rule_from_line(line, i + 1) {
+            rules.push(rule);
         }
-        prev_blank = trimmed.is_empty();
-        prev_line = Some(line);
+
+        scan_wiki_links_in_line(line, line_start, &code_span_ranges, &mut refs);
     }
 
     refs.sort_by_key(|r| format!("{r:?}"));
     refs.dedup_by_key(|r| format!("{r:?}"));
 
     (refs, rules)
+}
+
+/// Return true when `byte` falls inside any half-open `[start, end)` range
+/// in `ranges` (which must be sorted by `start`). Linear scan; the per-file
+/// range count is tiny in practice (≤ a few dozen).
+fn byte_in_any_range(byte: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|(s, e)| byte >= *s && byte < *e)
 }
 
 fn add_link_ref(refs: &mut Vec<SkillRef>, dest: &str) {
@@ -692,185 +561,34 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Scan raw body text for `[[wiki]]` style mentions that pulldown-cmark's
-/// event stream splits across multiple Text events. The event-driven scanner
-/// sees `[`, `[`, `inner`, `]`, `]` as five separate Text events, so the
-/// `[[...]]` branch in [`scan_mentions_and_files`] never fires in practice.
+/// Scan a single (non-code-block) line for `[[wiki]]` mentions, skipping any
+/// match that falls inside a pulldown-cmark inline code-span byte range. The
+/// raw `[[...]]` literal in a documentation example like
+/// `\`see [[other]]\`` is illustrative, not a real cross-reference, so it
+/// must not produce a Mention.
 ///
-/// Running a raw-text pass guarantees wiki-link mentions are captured. The
-/// deduplication step in [`extract_refs_and_rules`] absorbs any duplicates
-/// introduced by the combined approach.
-///
-/// The walker runs line-by-line and tracks fenced-code state with the same
-/// CommonMark §4.5 rules the rule extractor honors (≤3-space indent on the
-/// opener, matching backtick/tilde character, info string forbidden on the
-/// closer, fence run length ≥ opener). Inside a fenced block the line is
-/// skipped entirely; outside, ranges between backticks are masked so that an
-/// inline code span like `\`see [[other]]\`` doesn't leak the wiki target.
-///
-/// Without this gating a documentation skill that explains the wiki-link
-/// syntax in a sample (e.g. `\`\`\`markdown\nSee [[other-skill]] for
-/// details.\n\`\`\``) would silently pin `other-skill` as a real
-/// cross-reference — suppressing the genuine `dead` diagnostic on it and
-/// polluting the dependency graph with phantom edges. Same false-positive
-/// class as the cycle-A / cycle-U fence-aware rule extractor.
-fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
-    let mut in_fence = false;
-    let mut fence_marker: Option<String> = None;
-    // Mirror the indented-code-block tracking from `extract_refs_and_rules`
-    // (eval-U / eval-Z lockstep). A `[[wiki-link]]` that lives inside a
-    // CommonMark §4.4 indented code block — 4+ leading spaces or a tab,
-    // preceded by a blank line OR an ATX heading / setext underline /
-    // thematic break — is illustrative, NOT a real cross-reference. Without
-    // this gate, the wiki walker pinned `[[fictitious-skill]]` from inside
-    // an indented sample as a live edge, suppressing the genuine `dead`
-    // diagnostic and polluting the dependency graph with phantom edges.
-    // Same noise class as the cycle-Z post-heading-indented-code fix in the
-    // rule extractor — every parse-surface walker must agree on which lines
-    // are code and which are prose.
-    let mut prev_blank = true;
-    let mut prev_line: Option<&str> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        // Mirror the tab-rejection from `extract_refs_and_rules` so the wiki
-        // walker stays in lockstep with the rule extractor on tab-prefixed
-        // fence opens/closes — see CommonMark §4.5 and the long comment over
-        // there for the full rationale.
-        let starts_with_tab = line.starts_with('\t');
-        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let fence_kind = if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("```") {
-            Some('`')
-        } else if !starts_with_tab && leading_spaces <= 3 && trimmed.starts_with("~~~") {
-            Some('~')
-        } else {
-            None
-        };
-        if let Some(ch) = fence_kind {
-            let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
-            let after_run: &str = trimmed[run.len()..].trim_end();
-            let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
-            // Per CommonMark §4.5: "If the info string comes after a backtick
-            // fence, it may not contain any backtick characters." So a line
-            // like ```rust`bad`info is NOT a valid opener — it's paragraph
-            // text. The main rule extractor enforces this (see eval-Z); the
-            // wiki walker MUST stay in lockstep, otherwise it opens a phantom
-            // fence and silently swallows every real `[[...]]` mention until
-            // a matching backtick run happens to close the fake block (or
-            // until EOF, in which case the entire rest of the body becomes
-            // invisible to wiki-link extraction).
-            //
-            // Same noise class as eval-Z but for the raw wiki walker rather
-            // than the rule extractor. Tilde fences are NOT subject to the
-            // same restriction (info strings on tilde fences may legally
-            // contain backticks), so the guard is gated on `ch == '`'`.
-            let is_valid_opener = if ch == '`' {
-                !after_run.contains('`')
-            } else {
-                true
-            };
-            if in_fence {
-                // Same-character guard mirrors the rule extractor (eval-CC):
-                // per CommonMark §4.5, a `~~~` line cannot close a backtick
-                // fence and a `\`\`\`` line cannot close a tilde fence —
-                // the closer must use the same character as the opener.
-                // Without this guard, an illustrative `~~~` line inside a
-                // real backtick fence prematurely terminated the block and
-                // exposed any `[[wiki]]` mention below as a real cross-
-                // reference.
-                if let Some(open) = &fence_marker {
-                    let open_ch = open.chars().next();
-                    if is_valid_closer && run.len() >= open.len() && open_ch == Some(ch) {
-                        in_fence = false;
-                        fence_marker = None;
-                    }
-                }
-                prev_blank = false;
-                // Do NOT update prev_line here. The rule extractor
-                // (extract_refs_and_rules) deliberately keeps prev_line at
-                // whatever non-fence content line came before the fence —
-                // so that an ATX heading / setext underline / thematic
-                // break that immediately preceded the fence still counts as
-                // the block-terminator for any indented chunk that follows
-                // a fence-close. Updating prev_line to the literal `\`\`\``
-                // line would silently break that lockstep: a body like
-                //
-                //     # Heading
-                //     ```
-                //     ```
-                //         [[fictitious]]
-                //
-                // would have its trailing indented `[[wiki]]` correctly
-                // suppressed by the rule extractor (prev_line == `# Heading`
-                // → block-terminator → indented-code) but extracted by the
-                // wiki walker (prev_line == ```` `` → not a terminator →
-                // paragraph continuation). Same false-positive class as
-                // every previous lockstep regression (eval-V through
-                // eval-BB): code samples are illustrative, not assertive.
-                continue;
-            }
-            if is_valid_opener {
-                in_fence = true;
-                fence_marker = Some(run);
-                prev_blank = false;
-                // See the long comment on the close-side branch above —
-                // prev_line must stay at the previous non-fence content
-                // line so the post-fence indented-code detector keeps
-                // working in lockstep with the rule extractor.
-                continue;
-            }
-            // Invalid backtick-info-string opener: fall through and treat the
-            // line as ordinary paragraph text so any `[[...]]` mention on the
-            // same line is captured.
-        }
-        if in_fence {
-            prev_blank = trimmed.is_empty();
-            prev_line = Some(line);
-            continue;
-        }
-        // Indented code block: 4+ leading spaces (or a leading tab) preceded
-        // by a blank line OR a block-terminator (ATX heading, setext
-        // underline, thematic break). Mirrors the rule extractor's eval-U /
-        // eval-Z logic so the two walkers stay in lockstep.
-        let prev_was_terminator = prev_blank
-            || prev_line
-                .map(|p| is_atx_heading(p) || is_thematic_break(p) || is_setext_underline(p))
-                .unwrap_or(false);
-        let is_indented_code = prev_was_terminator && is_indented_code_line(line);
-        if !is_indented_code {
-            scan_wiki_links_in_line(line, refs);
-        }
-        prev_blank = trimmed.is_empty();
-        prev_line = Some(line);
-    }
-}
-
-/// Scan a single (non-fenced) line for `[[wiki]]` mentions, masking out
-/// ranges enclosed in backtick code spans. A `[[...]]` that opens or closes
-/// inside a backtick run is treated as illustrative and skipped.
-fn scan_wiki_links_in_line(line: &str, refs: &mut Vec<SkillRef>) {
+/// `line_offset` is the byte position of `line` within the parsed body; it
+/// is used to translate per-line offsets into the absolute byte coordinates
+/// the `code_span_ranges` index uses. `code_span_ranges` is the sorted list
+/// of `(start, end)` pairs collected from `Event::Code` during the
+/// pulldown-cmark pass in `extract_refs_and_rules`.
+fn scan_wiki_links_in_line(
+    line: &str,
+    line_offset: usize,
+    code_span_ranges: &[(usize, usize)],
+    refs: &mut Vec<SkillRef>,
+) {
     let bytes = line.as_bytes();
     let mut i = 0;
-    let mut in_code_span = false;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'`' {
-            in_code_span = !in_code_span;
-            i += 1;
-            continue;
-        }
-        if !in_code_span && bytes[i] == b'[' && bytes[i + 1] == b'[' {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
             let start = i + 2;
             if let Some(rel) = line[start..].find("]]") {
-                // Reject the match if the closing `]]` lands inside a code
-                // span that opened later on the same line.
-                let mut probe_in_code = false;
-                let mut k = i;
-                while k < start + rel {
-                    if bytes[k] == b'`' {
-                        probe_in_code = !probe_in_code;
-                    }
-                    k += 1;
-                }
-                if !probe_in_code {
+                let abs_open = line_offset + i;
+                let abs_close = line_offset + start + rel + 1;
+                let inside_code = byte_in_any_range(abs_open, code_span_ranges)
+                    || byte_in_any_range(abs_close, code_span_ranges);
+                if !inside_code {
                     let inner = &line[start..start + rel];
                     if let Some(target) = wiki_link_target(inner) {
                         refs.push(SkillRef::Mention {
@@ -886,91 +604,17 @@ fn scan_wiki_links_in_line(line: &str, refs: &mut Vec<SkillRef>) {
     }
 }
 
-/// True when `line` looks like an ATX heading per CommonMark §4.2:
-/// 0–3 leading spaces, then 1–6 `#` characters, then end-of-line OR a space
-/// followed by content. The intent is "this line terminates the prior block,
-/// so an indented chunk that follows it is a fresh code block, not a
-/// paragraph continuation."
-fn is_atx_heading(line: &str) -> bool {
-    if line.starts_with('\t') {
-        return false;
-    }
-    let leading = line.bytes().take_while(|&b| b == b' ').count();
-    if leading > 3 {
-        return false;
-    }
-    let rest = &line[leading..];
-    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
-    if hashes == 0 || hashes > 6 {
-        return false;
-    }
-    let after = &rest[hashes..];
-    after.is_empty() || after.starts_with(' ') || after.starts_with('\t')
-}
-
-/// True when `line` is a CommonMark §4.1 thematic break (HR): 0–3 leading
-/// spaces, then 3+ of `-`/`*`/`_` (any combination of those plus optional
-/// internal spaces/tabs), and nothing else. Like ATX headings, this line
-/// terminates the prior block.
-fn is_thematic_break(line: &str) -> bool {
-    if line.starts_with('\t') {
-        return false;
-    }
-    let leading = line.bytes().take_while(|&b| b == b' ').count();
-    if leading > 3 {
-        return false;
-    }
-    let rest = line[leading..].trim_end();
-    if rest.is_empty() {
-        return false;
-    }
-    let first = rest.as_bytes()[0];
-    if first != b'-' && first != b'*' && first != b'_' {
-        return false;
-    }
-    let mut count = 0usize;
-    for b in rest.bytes() {
-        match b {
-            b' ' | b'\t' => {}
-            c if c == first => count += 1,
-            _ => return false,
-        }
-    }
-    count >= 3
-}
-
-/// True when `line` is a CommonMark §4.3 setext heading underline: 0–3
-/// leading spaces, then a run of `=` (h1) or `-` (h2), optional trailing
-/// whitespace. We do NOT verify that the *prior* line was non-blank
-/// paragraph text — the caller (rule extractor) already tracks `prev_blank`
-/// and so will only treat this as a block-terminator when the line above
-/// was non-empty (the setext-underline-following-blank case is a
-/// thematic-break, which is also a block-terminator). The conservative
-/// rule here is enough to recover the heading-then-indented-code pattern
-/// without misclassifying paragraph continuations.
-fn is_setext_underline(line: &str) -> bool {
-    if line.starts_with('\t') {
-        return false;
-    }
-    let leading = line.bytes().take_while(|&b| b == b' ').count();
-    if leading > 3 {
-        return false;
-    }
-    let rest = line[leading..].trim_end();
-    if rest.is_empty() {
-        return false;
-    }
-    let first = rest.as_bytes()[0];
-    if first != b'=' && first != b'-' {
-        return false;
-    }
-    rest.bytes().all(|b| b == first)
-}
-
 /// True when `line` looks like an indented code-block line per CommonMark:
 /// 4+ leading spaces or a leading tab, and at least one non-whitespace
 /// character. Empty / whitespace-only lines are excluded so that blank
 /// separators between code blocks don't themselves count as code.
+///
+/// The runtime extractor no longer consults this helper — pulldown-cmark's
+/// event stream already emits `Tag::CodeBlock(CodeBlockKind::Indented)` for
+/// these lines and the byte-range index in `extract_refs_and_rules` makes
+/// the membership test trivial. The helper is retained as a `cfg(test)`
+/// CommonMark §4.4 line-classifier the regression test pins.
+#[cfg(test)]
 fn is_indented_code_line(line: &str) -> bool {
     if line.trim().is_empty() {
         return false;
@@ -1988,6 +1632,185 @@ mod tests {
                  mention_fired={mention_fired}; both walkers must agree on whether the \
                  indented line is code or prose"
             );
+        }
+    }
+
+    /// Tiny oracle: build the set of body line indices that pulldown-cmark
+    /// considers part of a `Tag::CodeBlock` (fenced or indented). Any line
+    /// not in this set is "prose" per the canonical CommonMark parser, and
+    /// both the rule extractor and the wiki-link walker MUST agree with it.
+    /// The eval-DD refactor pinned both walkers to this oracle by routing
+    /// fence/code detection through `Parser::into_offset_iter` instead of
+    /// hand-rolling parallel state machines.
+    fn lines_inside_code_per_pulldown(body: &str) -> std::collections::HashSet<usize> {
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_TABLES);
+        options.insert(Options::ENABLE_STRIKETHROUGH);
+        options.insert(Options::ENABLE_FOOTNOTES);
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut depth = 0usize;
+        let mut start: Option<usize> = None;
+        for (ev, range) in Parser::new_ext(body, options).into_offset_iter() {
+            match ev {
+                Event::Start(Tag::CodeBlock(_)) => {
+                    if depth == 0 {
+                        start = Some(range.start);
+                    }
+                    depth += 1;
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        if let Some(s) = start.take() {
+                            ranges.push((s, range.end));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut set = std::collections::HashSet::new();
+        let mut byte = 0usize;
+        for (i, line) in body.lines().enumerate() {
+            let line_start = byte;
+            let line_end = line_start + line.len();
+            byte = line_end + 1;
+            // Match the runtime predicate in `extract_refs_and_rules`: a
+            // line counts as inside a CodeBlock if EITHER the starting byte
+            // OR the last content byte falls within a range. The
+            // start-only check misses `Tag::CodeBlock(Indented)` ranges,
+            // which begin AFTER the line's leading whitespace prefix.
+            let last = line_end.saturating_sub(1);
+            if ranges
+                .iter()
+                .any(|(s, e)| (line_start >= *s && line_start < *e) || (last >= *s && last < *e))
+            {
+                set.insert(i);
+            }
+        }
+        set
+    }
+
+    #[test]
+    fn lockstep_parity_with_pulldown_oracle_rule_extraction() {
+        // Eval-DD lockstep parity: for every body that places a `MUST use
+        // \`x\`` line at a position pulldown-cmark classifies as code,
+        // `extract_refs_and_rules` must NOT emit a Rule. Conversely, when
+        // pulldown-cmark says the line is prose, the rule MUST extract. The
+        // pulldown event stream is the canonical CommonMark oracle — any
+        // disagreement is a re-introduction of the cycle V–CC bug class.
+        let bodies = [
+            // Plain prose
+            "MUST use `git`\n",
+            // Fenced code block
+            "```\nMUST use `phantom`\n```\n",
+            // Indented after blank
+            "Sample:\n\n    MUST use `phantom`\n",
+            // Indented after ATX heading (no blank separator)
+            "# Heading\n    MUST use `phantom`\n",
+            // Indented after setext h1
+            "Title\n===\n    MUST use `phantom`\n",
+            // Indented after setext h2
+            "Title\n---\n    MUST use `phantom`\n",
+            // Indented after thematic break
+            "para\n\n***\n    MUST use `phantom`\n",
+            // Indented paragraph continuation (NOT code)
+            "First line.\n    MUST use `bar`\n",
+            // 3-space-indented fence (still a fence)
+            "Code:\n\n   ```\nMUST use `phantom`\n   ```\n",
+            // Tab-prefixed `\`\`\`` (NOT a fence — indented code)
+            "Sample:\n\n\t```\n\t```\n\nMUST use `git`\n",
+            // Backtick info string with embedded backticks (NOT a fence)
+            "```rust`bad`info\nMUST use `phantom`\n```\nMUST use `real`\n",
+            // Tilde fence with backticks in info string (IS a fence)
+            "~~~text`bt`info\nMUST use `phantom`\n~~~\nMUST use `real`\n",
+            // Same-character closer rule: ~~~ cannot close a ``` fence
+            "```\nMUST use `phantom`\n~~~\nMUST use `still-phantom`\n```\nMUST use `real`\n",
+        ];
+        for body in bodies {
+            let code_lines = lines_inside_code_per_pulldown(body);
+            let (_refs, rules) = extract_refs_and_rules(body);
+            for (i, line) in body.lines().enumerate() {
+                if !line.contains("MUST use") {
+                    continue;
+                }
+                let want_rule = !code_lines.contains(&i);
+                let got_rule = rules.iter().any(|r| r.line == i + 1);
+                assert_eq!(
+                    want_rule, got_rule,
+                    "lockstep parity broken on rule extraction (body={body:?}, line {} = {line:?}): \
+                     pulldown says code={}, but extractor emitted rule={}",
+                    i + 1,
+                    !want_rule,
+                    got_rule,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lockstep_parity_with_pulldown_oracle_wiki_extraction() {
+        // Companion to the rule-extraction parity test: a `[[wiki-id]]`
+        // mention must extract iff pulldown-cmark classifies its containing
+        // line as prose. The pulldown event stream is the canonical
+        // CommonMark oracle — both line-walkers (rules and wiki) inherit
+        // their fence/indented-code state from it after eval-DD.
+        let bodies: &[(&str, &[&str], &[&str])] = &[
+            // (body, must-be-extracted, must-NOT-be-extracted)
+            ("See [[real-1]] here.\n", &["real-1"], &[]),
+            ("```\nSee [[fake-1]] sample.\n```\n", &[], &["fake-1"]),
+            ("Sample:\n\n    See [[fake-2]] sample.\n", &[], &["fake-2"]),
+            ("# Heading\n    See [[fake-3]] sample.\n", &[], &["fake-3"]),
+            ("Title\n---\n    See [[fake-4]] sample.\n", &[], &["fake-4"]),
+            (
+                "para\n\n***\n    See [[fake-5]] sample.\n",
+                &[],
+                &["fake-5"],
+            ),
+            (
+                "Use a wiki link by writing `[[fake-6]]` here.\nSee [[real-2]] too.\n",
+                &["real-2"],
+                &["fake-6"],
+            ),
+            (
+                "```\nSee [[fake-7]].\n~~~\n[[fake-8]]\n```\nReal: [[real-3]]\n",
+                &["real-3"],
+                &["fake-7", "fake-8"],
+            ),
+            (
+                "~~~text`bt`info\n[[fake-9]] inside.\n~~~\n[[real-4]]\n",
+                &["real-4"],
+                &["fake-9"],
+            ),
+            (
+                "```rust`bad`info\nSee [[real-5]] for details.\n",
+                &["real-5"],
+                &[],
+            ),
+        ];
+        for (body, must_extract, must_not_extract) in bodies {
+            let (refs, _rules) = extract_refs_and_rules(body);
+            let mentions: Vec<&str> = refs
+                .iter()
+                .filter_map(|r| match r {
+                    SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for id in *must_extract {
+                assert!(
+                    mentions.contains(id),
+                    "lockstep parity broken (body={body:?}): expected mention {id:?} in \
+                     extracted set; got {mentions:?}"
+                );
+            }
+            for id in *must_not_extract {
+                assert!(
+                    !mentions.contains(id),
+                    "lockstep parity broken (body={body:?}): {id:?} must NOT extract \
+                     (pulldown classifies its line as code); got {mentions:?}"
+                );
+            }
         }
     }
 }
