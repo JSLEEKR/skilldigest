@@ -433,7 +433,22 @@ fn emit(cli: &Cli, rendered: &str) -> Result<()> {
                     fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
                 }
             }
-            fs::write(path, rendered).map_err(|e| Error::io(path, e))?;
+            // Ensure file output ends with a trailing newline, matching the
+            // behaviour the stdout path already guarantees. Without this,
+            // `skilldigest ... > foo.json` and `skilldigest ... --output
+            // foo.json` produced byte-different files for formats whose
+            // renderer (notably `serde_json::to_string_pretty`) did not emit a
+            // final `\n` — violating the README's "same input → byte-identical
+            // output" determinism contract and tripping up POSIX-style tooling
+            // (git, diff, wc -l) that assumes a trailing newline.
+            if rendered.ends_with('\n') {
+                fs::write(path, rendered).map_err(|e| Error::io(path, e))?;
+            } else {
+                let mut buf = String::with_capacity(rendered.len() + 1);
+                buf.push_str(rendered);
+                buf.push('\n');
+                fs::write(path, &buf).map_err(|e| Error::io(path, e))?;
+            }
         }
         None => {
             // Treat `BrokenPipe` as a clean termination rather than an

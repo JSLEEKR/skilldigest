@@ -1718,3 +1718,52 @@ fn markdown_link_to_agent_md_lowercase_resolves_to_skill_id() {
         "markdown link `./foo/agent.md` must produce a refs_in edge on `foo`; summary={foo}"
     );
 }
+
+#[test]
+fn output_to_file_matches_stdout_redirect_byte_for_byte() {
+    // Bug P-1: `--output foo.json` and `> foo.json` produced different bytes.
+    // The stdout path appended a trailing `\n` when the rendered payload did
+    // not end with one (JSON pretty-print is the canonical offender); the
+    // `--output` path wrote raw `rendered` unchanged, leaving the file with no
+    // final newline. Two commands documented as equivalent then produced
+    // byte-different files — a violation of the README's
+    // "same input → byte-identical output" determinism promise and a surprise
+    // to POSIX tooling (`wc -l`, `git diff`, `diff -u`).
+    //
+    // The fix: the file path now guarantees the same trailing-newline
+    // behaviour as stdout. Regression test pins the invariant by running the
+    // binary both ways and asserting the bytes match.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::write(dir.path().join("a/SKILL.md"), b"---\nname: a\n---\nbody\n").unwrap();
+
+    let out_path = dir.path().join("via-flag.json");
+    let status = Command::new(bin())
+        .args([
+            "scan",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scan --output");
+    assert!(status.success());
+
+    let pipe = Command::new(bin())
+        .args(["scan", dir.path().to_str().unwrap(), "--format", "json"])
+        .output()
+        .expect("run scan > stdout");
+    assert!(pipe.status.success());
+
+    let file_bytes = std::fs::read(&out_path).expect("read via-flag.json");
+    assert_eq!(
+        file_bytes, pipe.stdout,
+        "--output <file> and redirect must produce byte-identical payloads"
+    );
+    assert!(
+        file_bytes.ends_with(b"\n"),
+        "file output must end with a trailing newline (POSIX text-file convention)"
+    );
+}
