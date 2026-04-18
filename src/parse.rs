@@ -713,6 +713,25 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
             let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
             let after_run: &str = trimmed[run.len()..].trim_end();
             let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
+            // Per CommonMark §4.5: "If the info string comes after a backtick
+            // fence, it may not contain any backtick characters." So a line
+            // like ```rust`bad`info is NOT a valid opener — it's paragraph
+            // text. The main rule extractor enforces this (see eval-Z); the
+            // wiki walker MUST stay in lockstep, otherwise it opens a phantom
+            // fence and silently swallows every real `[[...]]` mention until
+            // a matching backtick run happens to close the fake block (or
+            // until EOF, in which case the entire rest of the body becomes
+            // invisible to wiki-link extraction).
+            //
+            // Same noise class as eval-Z but for the raw wiki walker rather
+            // than the rule extractor. Tilde fences are NOT subject to the
+            // same restriction (info strings on tilde fences may legally
+            // contain backticks), so the guard is gated on `ch == '`'`.
+            let is_valid_opener = if ch == '`' {
+                !after_run.contains('`')
+            } else {
+                true
+            };
             if in_fence {
                 if let Some(open) = &fence_marker {
                     if is_valid_closer && run.len() >= open.len() {
@@ -720,11 +739,16 @@ fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
                         fence_marker = None;
                     }
                 }
-            } else {
+                continue;
+            }
+            if is_valid_opener {
                 in_fence = true;
                 fence_marker = Some(run);
+                continue;
             }
-            continue;
+            // Invalid backtick-info-string opener: fall through and treat the
+            // line as ordinary paragraph text so any `[[...]]` mention on the
+            // same line is captured.
         }
         if in_fence {
             continue;
@@ -1584,6 +1608,52 @@ mod tests {
                 SkillRef::Mention { skill_id } if skill_id.as_str() == "real-skill"
             )),
             "wiki-link after tab-prefixed (fake) fence pair must still extract; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_walker_backtick_info_string_fence_not_an_opener() {
+        // Lockstep regression for eval-AA: the wiki walker previously opened a
+        // phantom fence on `\`\`\`rust\`bad\`info` (a line that pulldown-cmark
+        // and the main rule extractor correctly treat as paragraph text per
+        // CommonMark §4.5 — info strings on backtick fences may not contain
+        // backticks). With the phantom fence open, the `[[real-skill]]` line
+        // below was silently swallowed because the walker was waiting for a
+        // matching closing run that never came (or only came at EOF, by which
+        // point every subsequent mention had been dropped).
+        let body = "```rust`bad`info\nSee [[real-skill]] for details.\n";
+        let (refs, _rules) = extract_refs_and_rules(body);
+        assert!(
+            refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "real-skill"
+            )),
+            "wiki-link after invalid backtick-info-string fence opener must extract; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_walker_tilde_info_string_fence_still_opens() {
+        // Tilde fences are NOT subject to the backtick-in-info-string
+        // restriction — `~~~text\`backtick\`info` IS a valid opener. The
+        // wiki walker must keep treating it as a fence opener so the
+        // `[[fake-inside]]` mention below stays suppressed.
+        let body = "~~~text`backtick`info\n[[fake-inside]] should be sample\n~~~\n[[real-after]]\n";
+        let (refs, _rules) = extract_refs_and_rules(body);
+        let mentions: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            mentions.contains(&"real-after"),
+            "wiki-link after tilde fence close must extract; {mentions:?}"
+        );
+        assert!(
+            !mentions.contains(&"fake-inside"),
+            "wiki-link inside tilde fence (with backticks in info string) must remain suppressed; {mentions:?}"
         );
     }
 
