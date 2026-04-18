@@ -322,6 +322,12 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
     let mut in_fence = false;
     let mut fence_marker: Option<String> = None;
     let mut prev_blank = true; // Treat the start of body as if preceded by blank.
+                               // Track the *previous non-fence line* for setext-underline detection: a
+                               // line of `===` or `---` immediately following non-blank paragraph text
+                               // converts that text into a heading. We only need the prior line's
+                               // contents (specifically, "was it non-empty paragraph text?") to detect
+                               // the pattern.
+    let mut prev_line: Option<&str> = None;
     for (i, line) in body.lines().enumerate() {
         let trimmed = line.trim_start();
         // Recognise both ```...``` and ~~~...~~~ fences. A fence opens with 3+
@@ -388,6 +394,24 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
             // elsewhere in the library.
             let after_run: &str = trimmed[run.len()..].trim_end();
             let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
+            // Per CommonMark §4.5: "If the info string comes after a backtick
+            // fence, it may not contain any backtick characters." So a line
+            // like ```rust`bad`info is NOT a fence opener — it's a paragraph
+            // start (the inline-parse rule otherwise misinterprets the closing
+            // backtick of an inline-code span as a fence opener). Without this
+            // guard the parser opened a phantom fence and silently swallowed
+            // every real `MUST use foo` line that followed until a matching
+            // backtick run happened to close the fake block (or until EOF).
+            // pulldown-cmark agrees the line is paragraph text, so this fix
+            // realigns our line-based extractor with the canonical event
+            // stream. Tilde fences are NOT subject to the same restriction
+            // (info strings on tilde fences may legally contain backticks),
+            // so the guard is gated on `ch == '`'`.
+            let is_valid_opener = if ch == '`' {
+                !after_run.contains('`')
+            } else {
+                true
+            };
             if in_fence {
                 // Only close if the marker matches (same char, ≥ opening len)
                 // AND the line carries no info string after the run.
@@ -397,15 +421,23 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
                         fence_marker = None;
                     }
                 }
-            } else {
+                prev_blank = false;
+                continue;
+            }
+            if is_valid_opener {
                 in_fence = true;
                 fence_marker = Some(run);
+                prev_blank = false;
+                continue;
             }
+            // Backtick fence with backticks in the info string — fall through
+            // and treat the line as ordinary paragraph text (rule extraction
+            // applies). prev_blank stays false.
             prev_blank = false;
-            continue;
         }
         if in_fence {
             prev_blank = trimmed.is_empty();
+            prev_line = Some(line);
             continue;
         }
         // CommonMark indented code block: a line with 4+ leading spaces (or a
@@ -417,13 +449,32 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
         // the fenced equivalent. Detecting this requires tracking the
         // previous line's blankness, since a continuation line of an ongoing
         // paragraph that happens to be deeply indented is NOT a code block.
-        let is_indented_code = prev_blank && is_indented_code_line(line);
+        //
+        // Per CommonMark §4.4 "An indented code block cannot interrupt a
+        // paragraph, so there must be a blank line between a paragraph and a
+        // following indented code block." But a HEADING is not a paragraph —
+        // it terminates the prior block on its own — so an indented chunk
+        // immediately following an ATX heading (`# foo`), a setext heading
+        // underline (`====` / `----`), or a thematic break (`---` / `***`)
+        // IS an indented code block even without a blank-line separator.
+        // Without this widening, a sample like
+        //
+        //     # Heading
+        //         MUST use `phantom`
+        //
+        // wrongly extracted `phantom` as a real rule (see Y2 / Y2b probe).
+        let prev_was_terminator = prev_blank
+            || prev_line
+                .map(|p| is_atx_heading(p) || is_thematic_break(p) || is_setext_underline(p))
+                .unwrap_or(false);
+        let is_indented_code = prev_was_terminator && is_indented_code_line(line);
         if !is_indented_code {
             if let Some(rule) = extract_rule_from_line(line, i + 1) {
                 rules.push(rule);
             }
         }
         prev_blank = trimmed.is_empty();
+        prev_line = Some(line);
     }
 
     refs.sort_by_key(|r| format!("{r:?}"));
@@ -722,6 +773,87 @@ fn scan_wiki_links_in_line(line: &str, refs: &mut Vec<SkillRef>) {
         }
         i += 1;
     }
+}
+
+/// True when `line` looks like an ATX heading per CommonMark §4.2:
+/// 0–3 leading spaces, then 1–6 `#` characters, then end-of-line OR a space
+/// followed by content. The intent is "this line terminates the prior block,
+/// so an indented chunk that follows it is a fresh code block, not a
+/// paragraph continuation."
+fn is_atx_heading(line: &str) -> bool {
+    if line.starts_with('\t') {
+        return false;
+    }
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return false;
+    }
+    let rest = &line[leading..];
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    if hashes == 0 || hashes > 6 {
+        return false;
+    }
+    let after = &rest[hashes..];
+    after.is_empty() || after.starts_with(' ') || after.starts_with('\t')
+}
+
+/// True when `line` is a CommonMark §4.1 thematic break (HR): 0–3 leading
+/// spaces, then 3+ of `-`/`*`/`_` (any combination of those plus optional
+/// internal spaces/tabs), and nothing else. Like ATX headings, this line
+/// terminates the prior block.
+fn is_thematic_break(line: &str) -> bool {
+    if line.starts_with('\t') {
+        return false;
+    }
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return false;
+    }
+    let rest = line[leading..].trim_end();
+    if rest.is_empty() {
+        return false;
+    }
+    let first = rest.as_bytes()[0];
+    if first != b'-' && first != b'*' && first != b'_' {
+        return false;
+    }
+    let mut count = 0usize;
+    for b in rest.bytes() {
+        match b {
+            b' ' | b'\t' => {}
+            c if c == first => count += 1,
+            _ => return false,
+        }
+    }
+    count >= 3
+}
+
+/// True when `line` is a CommonMark §4.3 setext heading underline: 0–3
+/// leading spaces, then a run of `=` (h1) or `-` (h2), optional trailing
+/// whitespace. We do NOT verify that the *prior* line was non-blank
+/// paragraph text — the caller (rule extractor) already tracks `prev_blank`
+/// and so will only treat this as a block-terminator when the line above
+/// was non-empty (the setext-underline-following-blank case is a
+/// thematic-break, which is also a block-terminator). The conservative
+/// rule here is enough to recover the heading-then-indented-code pattern
+/// without misclassifying paragraph continuations.
+fn is_setext_underline(line: &str) -> bool {
+    if line.starts_with('\t') {
+        return false;
+    }
+    let leading = line.bytes().take_while(|&b| b == b' ').count();
+    if leading > 3 {
+        return false;
+    }
+    let rest = line[leading..].trim_end();
+    if rest.is_empty() {
+        return false;
+    }
+    let first = rest.as_bytes()[0];
+    if first != b'=' && first != b'-' {
+        return false;
+    }
+    rest.bytes().all(|b| b == first)
 }
 
 /// True when `line` looks like an indented code-block line per CommonMark:

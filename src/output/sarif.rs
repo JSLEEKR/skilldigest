@@ -63,11 +63,22 @@ pub fn render(report: &Report) -> Result<String> {
             "message": { "text": issue.message },
         });
         if let Some(loc) = &issue.location {
+            // SARIF 2.1.0 §3.4.4 requires `artifactLocation.uri` to be a
+            // valid URI Reference per RFC 3986. Path components that contain
+            // a space, non-ASCII byte, or any of the URI reserved/control
+            // characters must be percent-encoded — without that step a path
+            // like `my dir/SKILL.md` or `한글/SKILL.md` produced invalid URIs
+            // that GitHub code-scanning's SARIF validator rejects with
+            // "value does not match URI format". `/` is preserved as the
+            // path separator. `\` is normalised to `/` first so Windows-style
+            // paths land in the same shape.
+            let raw = loc.path.to_string_lossy().replace('\\', "/");
+            let uri = encode_uri_path(&raw);
             result["locations"] = serde_json::json!([
                 {
                     "physicalLocation": {
                         "artifactLocation": {
-                            "uri": loc.path.to_string_lossy().replace('\\', "/")
+                            "uri": uri
                         },
                         "region": {
                             "startLine": loc.line.max(1),
@@ -118,6 +129,52 @@ pub fn render(report: &Report) -> Result<String> {
     });
 
     serde_json::to_string_pretty(&sarif).map_err(|e| Error::Other(anyhow::anyhow!("sarif: {e}")))
+}
+
+/// Percent-encode a forward-slash-separated path so the result is a valid
+/// RFC 3986 URI Reference (relative-path form). Each path segment is
+/// independently encoded with the `pchar` rule (unreserved + sub-delims +
+/// `:` + `@`), and `/` separators are preserved untouched. Non-ASCII bytes
+/// are percent-encoded one byte at a time after UTF-8 expansion. ASCII
+/// control bytes (< 0x20) and DEL (0x7F) are also percent-encoded.
+///
+/// Why this matters: GitHub code-scanning's SARIF validator (and the OASIS
+/// reference checker) rejects `artifactLocation.uri` values that contain
+/// raw spaces, non-ASCII bytes, or control characters. A skill library
+/// hosted under a directory like `Skill Library/SKILL.md` or `한글/SKILL.md`
+/// would otherwise upload as invalid SARIF and never surface in the PR
+/// review UI.
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, segment) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        for byte in segment.bytes() {
+            if is_uri_pchar_unreserved(byte) {
+                out.push(byte as char);
+            } else {
+                use std::fmt::Write;
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// True when `byte` is allowed unencoded in an RFC 3986 path segment.
+/// Subset chosen to match the `pchar` production minus the percent sign
+/// (which is itself percent-encoded if it appears literally in a path).
+fn is_uri_pchar_unreserved(byte: u8) -> bool {
+    matches!(byte,
+        b'A'..=b'Z'
+        | b'a'..=b'z'
+        | b'0'..=b'9'
+        | b'-' | b'.' | b'_' | b'~'    // unreserved
+        | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+        | b'*' | b'+' | b',' | b';' | b'='   // sub-delims
+        | b':' | b'@'                  // pchar extras
+    )
 }
 
 fn rule_short(k: IssueKind) -> &'static str {
@@ -292,6 +349,136 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("b"));
+    }
+
+    #[test]
+    fn sarif_uri_percent_encodes_spaces() {
+        // SARIF 2.1.0 §3.4.4 requires the artifactLocation.uri to be a valid
+        // RFC 3986 URI Reference. A literal space is illegal in a URI and
+        // GitHub code-scanning's SARIF validator rejects it. The encoder
+        // must convert " " to "%20" while preserving "/" as the path
+        // separator.
+        let issue = Issue::new(IssueKind::Bloated, SkillId::new("a"), "too big")
+            .with_location(Location::start_of("my dir/SKILL.md"));
+        let r = Report {
+            schema_version: crate::SCHEMA_VERSION,
+            tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
+            tool_version: crate::VERSION,
+            scan_root: ".".into(),
+            total_skills: 1,
+            total_tokens: 0,
+            budget: BudgetConfig {
+                per_skill: 2000,
+                total: None,
+            },
+            skills: vec![],
+            issues: vec![issue],
+            loadout: None,
+        };
+        let s = render(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let uri = v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            ["artifactLocation"]["uri"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            uri, "my%20dir/SKILL.md",
+            "spaces must be %20-encoded; got {uri:?}"
+        );
+        assert!(
+            !uri.contains(' '),
+            "raw space leaked into SARIF uri: {uri:?}"
+        );
+    }
+
+    #[test]
+    fn sarif_uri_percent_encodes_non_ascii() {
+        // Non-ASCII path segments (Korean, Japanese, etc.) must be
+        // percent-encoded byte-by-byte after UTF-8 expansion. Without this
+        // the resulting URI fails RFC 3986 validation and SARIF readers
+        // either reject the file or strip the location entirely.
+        let issue = Issue::new(IssueKind::Dead, SkillId::new("k"), "unused")
+            .with_location(Location::start_of("한글/SKILL.md"));
+        let r = Report {
+            schema_version: crate::SCHEMA_VERSION,
+            tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
+            tool_version: crate::VERSION,
+            scan_root: ".".into(),
+            total_skills: 1,
+            total_tokens: 0,
+            budget: BudgetConfig {
+                per_skill: 2000,
+                total: None,
+            },
+            skills: vec![],
+            issues: vec![issue],
+            loadout: None,
+        };
+        let s = render(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let uri = v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            ["artifactLocation"]["uri"]
+            .as_str()
+            .unwrap();
+        // Korean "한글" is U+D55C U+AE00 → UTF-8: EC 9D 9C EA B8 80
+        assert_eq!(
+            uri, "%ED%95%9C%EA%B8%80/SKILL.md",
+            "non-ASCII bytes must be %-encoded; got {uri:?}"
+        );
+        for b in uri.bytes() {
+            assert!(
+                b.is_ascii() && b >= 0x20 && b != 0x7F,
+                "non-ASCII or control byte leaked into SARIF uri: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sarif_uri_preserves_slash_separator() {
+        // `/` is a path separator and must NOT be percent-encoded. Plain
+        // ASCII path segments must round-trip without decoration.
+        let issue = Issue::new(IssueKind::Stale, SkillId::new("git/commit"), "x")
+            .with_location(Location::start_of("git/commit/SKILL.md"));
+        let r = Report {
+            schema_version: crate::SCHEMA_VERSION,
+            tokenizer: "cl100k".into(),
+            tokenizer_version: "tiktoken-rs 0.7 cl100k".into(),
+            tool_version: crate::VERSION,
+            scan_root: ".".into(),
+            total_skills: 1,
+            total_tokens: 0,
+            budget: BudgetConfig {
+                per_skill: 2000,
+                total: None,
+            },
+            skills: vec![],
+            issues: vec![issue],
+            loadout: None,
+        };
+        let s = render(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let uri = v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]
+            ["artifactLocation"]["uri"]
+            .as_str()
+            .unwrap();
+        assert_eq!(uri, "git/commit/SKILL.md");
+    }
+
+    #[test]
+    fn encode_uri_path_basic_invariants() {
+        assert_eq!(encode_uri_path(""), "");
+        assert_eq!(encode_uri_path("a"), "a");
+        assert_eq!(encode_uri_path("a/b/c"), "a/b/c");
+        assert_eq!(encode_uri_path("a b"), "a%20b");
+        assert_eq!(encode_uri_path("a?b"), "a%3Fb");
+        assert_eq!(encode_uri_path("a#b"), "a%23b");
+        // CRLF / control characters must be encoded.
+        assert_eq!(encode_uri_path("a\tb"), "a%09b");
+        assert_eq!(encode_uri_path("a\nb"), "a%0Ab");
+        // Percent itself must be re-encoded (it is not in the unreserved set).
+        assert_eq!(encode_uri_path("a%b"), "a%25b");
     }
 
     #[test]
