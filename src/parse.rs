@@ -254,8 +254,25 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
     let parser = Parser::new_ext(body, options);
 
     let mut in_link_dest: Option<String> = None;
+    // Track fenced/indented code-block depth from the pulldown-cmark event
+    // stream so that `@mention` / tool invocations baked into illustrative
+    // code samples don't leak out as real cross-references. Pulldown-cmark
+    // emits `Event::Text` for the code lines inside a CodeBlock; without this
+    // gate, a documentation skill that explains the `@other-skill` syntax in
+    // a fenced sample would pin the (possibly fictitious) `other-skill` as a
+    // live reference, suppressing the genuine `dead` diagnostic on it and
+    // polluting the graph with phantom edges. This is the event-stream half
+    // of the same fix that the raw `scan_wiki_links_raw` walker now also
+    // applies for `[[wiki]]` mentions in code samples.
+    let mut in_code_block: usize = 0;
     for event in parser {
         match event {
+            Event::Start(Tag::CodeBlock(_kind)) => {
+                in_code_block += 1;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = in_code_block.saturating_sub(1);
+            }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 in_link_dest = Some(dest_url.to_string());
             }
@@ -264,17 +281,22 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
                     add_link_ref(&mut refs, &dest);
                 }
             }
-            Event::Code(ref c) => {
+            // `Event::Code` is an inline code span; tool-invocation extraction
+            // here is intentional because backtick-quoted `Bash(ls)` tokens are
+            // the documented way authors flag tool calls. Wiki/@mention
+            // extraction is NOT done on inline code spans (handled in the raw
+            // walker below, which now skips backtick-fenced regions itself).
+            // The match guard suppresses extraction inside fenced code blocks.
+            Event::Code(ref c) if in_code_block == 0 => {
                 scan_tool_invocation(c, &mut refs);
             }
-            Event::Text(ref t) => {
+            Event::Text(ref t) if in_code_block == 0 => {
                 scan_mentions_and_files(t, &mut refs);
                 scan_tool_invocation(t, &mut refs);
             }
             _ => {}
         }
     }
-
     // Wiki-link extraction must also run against the raw body, because
     // pulldown-cmark splits `[[...]]` across separate Text events (one each
     // for `[`, `[`, `inner`, `]`, `]`) — so the per-event `scan_mentions_and_files`
@@ -282,6 +304,14 @@ fn extract_refs_and_rules(body: &str) -> (Vec<SkillRef>, Vec<Rule>) {
     // pass on the raw body captures wiki-links without double-counting
     // @mentions (the raw scan collects both, but dedup below absorbs the
     // duplicates).
+    //
+    // The raw walker MUST track fenced-code state itself, because the body
+    // string still contains the literal `[[...]]` text inside any
+    // illustrative fenced sample — a documentation skill that shows
+    // `[[other-skill]]` in a markdown code block would otherwise pin
+    // `other-skill` as a real cross-reference. Same false-positive class as
+    // the cycle-A / cycle-U fence-aware rule extractor: code samples are
+    // illustrative, not assertive.
     scan_wiki_links_raw(body, &mut refs);
 
     // Rule extraction works line-by-line on the raw body, but must NOT
@@ -585,22 +615,90 @@ fn is_word_byte(b: u8) -> bool {
 /// Running a raw-text pass guarantees wiki-link mentions are captured. The
 /// deduplication step in [`extract_refs_and_rules`] absorbs any duplicates
 /// introduced by the combined approach.
+///
+/// The walker runs line-by-line and tracks fenced-code state with the same
+/// CommonMark §4.5 rules the rule extractor honors (≤3-space indent on the
+/// opener, matching backtick/tilde character, info string forbidden on the
+/// closer, fence run length ≥ opener). Inside a fenced block the line is
+/// skipped entirely; outside, ranges between backticks are masked so that an
+/// inline code span like `\`see [[other]]\`` doesn't leak the wiki target.
+///
+/// Without this gating a documentation skill that explains the wiki-link
+/// syntax in a sample (e.g. `\`\`\`markdown\nSee [[other-skill]] for
+/// details.\n\`\`\``) would silently pin `other-skill` as a real
+/// cross-reference — suppressing the genuine `dead` diagnostic on it and
+/// polluting the dependency graph with phantom edges. Same false-positive
+/// class as the cycle-A / cycle-U fence-aware rule extractor.
 fn scan_wiki_links_raw(text: &str, refs: &mut Vec<SkillRef>) {
-    let bytes = text.as_bytes();
+    let mut in_fence = false;
+    let mut fence_marker: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        let fence_kind = if leading_spaces <= 3 && trimmed.starts_with("```") {
+            Some('`')
+        } else if leading_spaces <= 3 && trimmed.starts_with("~~~") {
+            Some('~')
+        } else {
+            None
+        };
+        if let Some(ch) = fence_kind {
+            let run: String = trimmed.chars().take_while(|c| *c == ch).collect();
+            let after_run: &str = trimmed[run.len()..].trim_end();
+            let is_valid_closer = run.chars().all(|c| c == ch) && after_run.is_empty();
+            if in_fence {
+                if let Some(open) = &fence_marker {
+                    if is_valid_closer && run.len() >= open.len() {
+                        in_fence = false;
+                        fence_marker = None;
+                    }
+                }
+            } else {
+                in_fence = true;
+                fence_marker = Some(run);
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        scan_wiki_links_in_line(line, refs);
+    }
+}
+
+/// Scan a single (non-fenced) line for `[[wiki]]` mentions, masking out
+/// ranges enclosed in backtick code spans. A `[[...]]` that opens or closes
+/// inside a backtick run is treated as illustrative and skipped.
+fn scan_wiki_links_in_line(line: &str, refs: &mut Vec<SkillRef>) {
+    let bytes = line.as_bytes();
     let mut i = 0;
+    let mut in_code_span = false;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+        if bytes[i] == b'`' {
+            in_code_span = !in_code_span;
+            i += 1;
+            continue;
+        }
+        if !in_code_span && bytes[i] == b'[' && bytes[i + 1] == b'[' {
             let start = i + 2;
-            if let Some(rel) = text[start..].find("]]") {
-                let inner = &text[start..start + rel];
-                // Split Obsidian-style `[[target|display]]` aliases so the
-                // display half does not end up as the (never-resolvable)
-                // skill id. A space in the target itself still rejects the
-                // match as prose.
-                if let Some(target) = wiki_link_target(inner) {
-                    refs.push(SkillRef::Mention {
-                        skill_id: SkillId::new(target),
-                    });
+            if let Some(rel) = line[start..].find("]]") {
+                // Reject the match if the closing `]]` lands inside a code
+                // span that opened later on the same line.
+                let mut probe_in_code = false;
+                let mut k = i;
+                while k < start + rel {
+                    if bytes[k] == b'`' {
+                        probe_in_code = !probe_in_code;
+                    }
+                    k += 1;
+                }
+                if !probe_in_code {
+                    let inner = &line[start..start + rel];
+                    if let Some(target) = wiki_link_target(inner) {
+                        refs.push(SkillRef::Mention {
+                            skill_id: SkillId::new(target),
+                        });
+                    }
                 }
                 i = start + rel + 2;
                 continue;
@@ -1222,5 +1320,95 @@ mod tests {
     #[test]
     fn strip_link_modifiers_drops_query_only() {
         assert_eq!(strip_link_modifiers("./foo.md?v=1"), "./foo.md");
+    }
+
+    #[test]
+    fn wiki_link_inside_fenced_block_is_suppressed() {
+        // CommonMark: a fenced code block is literal — markup inside is text,
+        // not real cross-references. A documentation skill that explains the
+        // wiki-link syntax in a sample block must NOT pin the sample target
+        // as a live reference. Without this gate the raw `[[...]]` walker
+        // would silently turn an illustrative `[[other-skill]]` into a live
+        // edge that suppresses the genuine `dead` diagnostic and pollutes
+        // the dependency graph.
+        let body = "Example:\n\n```markdown\nSee [[fictitious-skill]] for details.\n```\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        assert!(
+            !refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "fictitious-skill"
+            )),
+            "wiki-link inside fenced code block must not be extracted; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn at_mention_inside_fenced_block_is_suppressed() {
+        // Same false-positive class for `@mention` text inside a fenced
+        // sample. Pulldown-cmark emits Event::Text for code-block contents;
+        // the event walker now tracks CodeBlock depth and skips mention
+        // extraction while inside.
+        let body = "Example:\n\n```\nSee @fictitious-mention for details.\n```\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        assert!(
+            !refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "fictitious-mention"
+            )),
+            "@mention inside fenced code block must not be extracted; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_link_inside_inline_code_span_is_suppressed() {
+        // An inline `\`[[...]]\`` is illustrative syntax, not a real link.
+        // The raw wiki walker now masks backtick-fenced regions of each line.
+        let body = "Use a wiki link by writing `[[other-skill]]` in markdown.\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        assert!(
+            !refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "other-skill"
+            )),
+            "wiki-link inside inline code span must not be extracted; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_link_outside_code_still_extracts() {
+        // Regression sanity: a real `[[...]]` outside any code context must
+        // still produce a Mention. The new gate must not over-suppress.
+        let body = "See [[real-skill]] for the canonical reference.\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        assert!(
+            refs.iter().any(|r| matches!(
+                r,
+                SkillRef::Mention { skill_id } if skill_id.as_str() == "real-skill"
+            )),
+            "real wiki-link outside code context must extract; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn wiki_link_mixed_real_and_sample() {
+        // The realistic case: a single skill body has a real cross-reference
+        // alongside an illustrative sample. Only the real one must survive.
+        let body = "See [[real]] for details.\n\n```\nExample: [[fake]] is illustrative.\n```\n";
+        let (refs, _) = extract_refs_and_rules(body);
+        let mentions: Vec<&str> = refs
+            .iter()
+            .filter_map(|r| match r {
+                SkillRef::Mention { skill_id } => Some(skill_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            mentions.contains(&"real"),
+            "real mention dropped; {mentions:?}"
+        );
+        assert!(
+            !mentions.contains(&"fake"),
+            "sample mention leaked from inside fence; {mentions:?}"
+        );
     }
 }
